@@ -1106,6 +1106,10 @@ pub const DEFAULT_GOOGLE_SNI_POOL: &[&str] = &[
     "translate.google.com",
     "play.google.com",
     "lens.google.com",
+    // chromewebstore.google.com — reported in issue #75 as a working
+    // SNI. Same family as the rest: wildcard cert, GFE-hosted,
+    // handshake against google_ip:443 with no content negotiation.
+    "chromewebstore.google.com",
 ];
 
 /// Build the pool of SNI hosts used for outbound connections to the Google

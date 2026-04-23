@@ -299,4 +299,6 @@ val DEFAULT_SNI_POOL: List<String> = listOf(
     "translate.google.com",
     "play.google.com",
     "lens.google.com",
+    // Issue #75.
+    "chromewebstore.google.com",
 )

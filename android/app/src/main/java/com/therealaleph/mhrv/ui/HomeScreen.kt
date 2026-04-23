@@ -385,12 +385,26 @@ fun HomeScreen(
                         // so a subsequent field edit can't overwrite the
                         // fresh values with pre-resolve ones.
                         scope.launch {
-                            val fresh = withContext(Dispatchers.IO) {
-                                NetworkDetect.resolveGoogleIp()
-                            }
+                            // Only auto-fill google_ip if it's empty.
+                            // Issue #71: some Iranian ISPs return
+                            // poisoned A records for www.google.com that
+                            // resolve but then refuse TLS (or route to a
+                            // Google IP that's not on the GFE and can't
+                            // handle our SNI-rewrite). If the user has
+                            // manually set a working IP
+                            // (e.g. 216.239.38.120), we must NOT
+                            // overwrite it with a poisoned fresh lookup
+                            // just because the two values differ. They
+                            // can still force a re-resolve via the
+                            // explicit "Auto-detect" button above.
                             var updated = cfg
-                            if (!fresh.isNullOrBlank() && fresh != updated.googleIp) {
-                                updated = updated.copy(googleIp = fresh)
+                            if (updated.googleIp.isBlank()) {
+                                val fresh = withContext(Dispatchers.IO) {
+                                    NetworkDetect.resolveGoogleIp()
+                                }
+                                if (!fresh.isNullOrBlank()) {
+                                    updated = updated.copy(googleIp = fresh)
+                                }
                             }
                             if (updated.frontDomain.isBlank() ||
                                 updated.frontDomain.parseAsIpOrNull() != null
