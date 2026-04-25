@@ -212,6 +212,8 @@ struct FormState {
     scan_batch_size:usize,
     google_ip_validation: bool,
     normalize_x_graphql: bool,
+    youtube_via_relay: bool,
+    passthrough_hosts: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -289,6 +291,8 @@ fn load_form() -> (FormState, Option<String>) {
             google_ip_validation: c.google_ip_validation,
             scan_batch_size:c.scan_batch_size,
             normalize_x_graphql: c.normalize_x_graphql,
+            youtube_via_relay: c.youtube_via_relay,
+            passthrough_hosts: c.passthrough_hosts.clone(),
         }
     } else {
         FormState {
@@ -314,6 +318,8 @@ fn load_form() -> (FormState, Option<String>) {
             google_ip_validation:true,
             scan_batch_size:500,
             normalize_x_graphql: false,
+            youtube_via_relay: false,
+            passthrough_hosts: Vec::new(),
         }
     };
     (form, load_err)
@@ -449,6 +455,13 @@ impl FormState {
             google_ip_validation:self.google_ip_validation,
             scan_batch_size:self.scan_batch_size,
             normalize_x_graphql: self.normalize_x_graphql,
+            // UI form doesn't expose youtube_via_relay yet — it's a
+            // config-only flag for now. Passed through from the loaded
+            // config if set, otherwise defaults to false.
+            youtube_via_relay: self.youtube_via_relay,
+            // Similarly config-only for now; round-trips through the
+            // file so the UI doesn't drop the user's entries on save.
+            passthrough_hosts: self.passthrough_hosts.clone(),
         })
     }
 }
@@ -487,6 +500,10 @@ struct ConfigWire<'a> {
     sni_hosts: Option<Vec<&'a str>>,
     #[serde(skip_serializing_if = "is_false")]
     normalize_x_graphql: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    youtube_via_relay: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    passthrough_hosts: &'a Vec<String>,
     // IP-scan knobs. These used to be missing from the wire struct, so
     // every Save-config silently dropped them — the user would toggle
     // "fetch from API" on, save, reopen, and find it off again. Add
@@ -538,6 +555,8 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
                 .as_ref()
                 .map(|v| v.iter().map(String::as_str).collect()),
             normalize_x_graphql: c.normalize_x_graphql,
+            youtube_via_relay: c.youtube_via_relay,
+            passthrough_hosts: &c.passthrough_hosts,
             fetch_ips_from_api: c.fetch_ips_from_api,
             max_ips_to_scan: c.max_ips_to_scan,
             scan_batch_size: c.scan_batch_size,
@@ -684,21 +703,26 @@ impl eframe::App for App {
             // apps_script.
             section(ui, "Mode", |ui| {
                 form_row(ui, "Mode", Some(
-                    "apps_script: full DPI bypass via your Apps Script relay.\n\
-                     google_only: bootstrap — direct SNI-rewrite tunnel to *.google.com \
-                     only (no relay, no script_id needed). Use this just long enough to \
-                     open https://script.google.com and deploy Code.gs."
+                    "apps_script: DPI bypass via Apps Script relay (needs cert).\n\
+                     full: tunnel ALL traffic through Apps Script + tunnel node (no cert needed).\n\
+                     google_only: bootstrap — direct SNI-rewrite tunnel to *.google.com only."
                 ), |ui| {
                     egui::ComboBox::from_id_source("mode")
                         .selected_text(match self.form.mode.as_str() {
                             "google_only" => "Google-only (bootstrap)",
-                            _ => "Apps Script (full)",
+                            "full" => "Full tunnel (no cert)",
+                            _ => "Apps Script (MITM)",
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.form.mode,
                                 "apps_script".into(),
-                                "Apps Script (full)",
+                                "Apps Script (MITM)",
+                            );
+                            ui.selectable_value(
+                                &mut self.form.mode,
+                                "full".into(),
+                                "Full tunnel (no cert)",
                             );
                             ui.selectable_value(
                                 &mut self.form.mode,
@@ -712,6 +736,15 @@ impl eframe::App for App {
                         ui.add_space(120.0 + 8.0);
                         ui.small(egui::RichText::new(
                             "Bootstrap mode — reach script.google.com to deploy Code.gs, then switch back to Apps Script.",
+                        )
+                        .color(OK_GREEN));
+                    });
+                }
+                if self.form.mode == "full" {
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.small(egui::RichText::new(
+                            "Full tunnel — all traffic tunneled end-to-end via Apps Script + remote tunnel node. No certificate needed.",
                         )
                         .color(OK_GREEN));
                     });
@@ -891,6 +924,19 @@ impl eframe::App for App {
                                  Credit: seramo_ir + Persian Python community (issue #16).",
                             );
                     });
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.checkbox(
+                            &mut self.form.youtube_via_relay,
+                            "Send YouTube through relay (no SNI rewrite)",
+                        )
+                        .on_hover_text(
+                            "YouTube normally uses the same direct Google-edge tunnel as google.com (TLS SNI is \
+                             the front domain, not youtube.com). That can trigger restricted mode or sign-out \
+                             prompts. Enable this to route youtube.com / youtu.be / ytimg.com through the Apps \
+                             Script relay instead — slower for video, but the visible SNI matches the site.",
+                        );
+                    });
                 });
             });
 
@@ -919,7 +965,7 @@ impl eframe::App for App {
                 (
                     s.running,
                     s.started_at,
-                    s.last_stats,
+                    s.last_stats.clone(),
                     s.ca_trusted,
                     s.last_test_msg.clone(),
                     s.last_per_site.clone(),
@@ -933,7 +979,7 @@ impl eframe::App for App {
                 "Traffic  ·  (not running)".to_string()
             };
             section(ui, &status_title, |ui| {
-                if let Some(s) = stats {
+                if let Some(s) = &stats {
                     // Compact two-column layout so 7 metrics fit in ~4 rows
                     // instead of a tall vertical strip.
                     let rows: Vec<(&str, String)> = vec![
@@ -996,6 +1042,85 @@ impl eframe::App for App {
                     );
                 }
             });
+
+            // ── Usage today (estimated) — daily budget tracker ───────────────
+            // Client-side estimate from our own atomic counters. Counts only
+            // successful relay calls this process saw since 00:00 UTC. Google's
+            // actual quota bucket is per-Apps-Script-project and per-Google
+            // account — if multiple devices share the same deployment, each
+            // client only sees its own share. We link to the Google dashboard
+            // for the authoritative number.
+            if let Some(s) = &stats {
+                ui.add_space(2.0);
+                section(ui, "Usage today (estimated)", |ui| {
+                    // Free-tier Apps Script UrlFetchApp quota. Workspace /
+                    // paid accounts get 100k but most users are on free.
+                    const FREE_QUOTA_PER_DAY: u64 = 20_000;
+                    let pct = if FREE_QUOTA_PER_DAY > 0 {
+                        (s.today_calls as f64 / FREE_QUOTA_PER_DAY as f64) * 100.0
+                    } else { 0.0 };
+                    let reset = s.today_reset_secs;
+                    let reset_str = format!(
+                        "{}h {}m",
+                        reset / 3600,
+                        (reset / 60) % 60,
+                    );
+                    let rows: Vec<(&str, String)> = vec![
+                        (
+                            "calls today",
+                            format!(
+                                "{} / {}  ({:.1}%)",
+                                s.today_calls, FREE_QUOTA_PER_DAY, pct
+                            ),
+                        ),
+                        ("bytes today", fmt_bytes(s.today_bytes)),
+                        ("UTC day", s.today_key.clone()),
+                        ("resets in", reset_str),
+                    ];
+                    egui::Grid::new("usage_today")
+                        .num_columns(4)
+                        .spacing([16.0, 4.0])
+                        .show(ui, |ui| {
+                            for chunk in rows.chunks(2) {
+                                for (label, value) in chunk.iter() {
+                                    ui.add_sized(
+                                        [110.0, 18.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(*label)
+                                                .color(egui::Color32::from_gray(150)),
+                                        ),
+                                    );
+                                    ui.add_sized(
+                                        [140.0, 18.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(value).monospace(),
+                                        ),
+                                    );
+                                }
+                                if chunk.len() == 1 {
+                                    ui.label("");
+                                    ui.label("");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.hyperlink_to(
+                            egui::RichText::new("View quota on Google →"),
+                            "https://script.google.com/home/usage",
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "  (authoritative — estimate is what this device relayed)",
+                            )
+                            .color(egui::Color32::from_gray(130))
+                            .italics()
+                            .small(),
+                        );
+                    });
+                });
+            }
 
             if !per_site.is_empty() {
                 ui.add_space(2.0);

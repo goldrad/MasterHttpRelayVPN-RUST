@@ -68,8 +68,10 @@ enum class UiLang { AUTO, FA, EN }
  *   Google edge is active, so the user can reach `script.google.com` to
  *   deploy Code.gs in the first place. No Deployment ID / Auth key needed.
  *   Non-Google traffic goes direct (no relay).
+ * - [FULL] — full tunnel mode. ALL traffic is tunneled end-to-end through
+ *   Apps Script + a remote tunnel node. No certificate installation needed.
  */
-enum class Mode { APPS_SCRIPT, GOOGLE_ONLY }
+enum class Mode { APPS_SCRIPT, GOOGLE_ONLY, FULL }
 
 data class MhrvConfig(
     val mode: Mode = Mode.APPS_SCRIPT,
@@ -91,6 +93,16 @@ data class MhrvConfig(
     val logLevel: String = "info",
     val parallelRelay: Int = 1,
     val upstreamSocks5: String = "",
+
+    /**
+     * User-configured hostnames that bypass Apps Script relay entirely
+     * and plain-TCP passthrough (via upstreamSocks5 if set). Each entry
+     * is either an exact hostname ("example.com") or a leading-dot
+     * suffix (".example.com" → matches example.com + any subdomain).
+     * See `src/config.rs` `passthrough_hosts` for semantics.
+     * Issues #39, #127.
+     */
+    val passthroughHosts: List<String> = emptyList(),
 
     /** VPN_TUN (everything routed) vs PROXY_ONLY (user configures per-app). */
     val connectionMode: ConnectionMode = ConnectionMode.VPN_TUN,
@@ -147,6 +159,7 @@ data class MhrvConfig(
             put("mode", when (mode) {
                 Mode.APPS_SCRIPT -> "apps_script"
                 Mode.GOOGLE_ONLY -> "google_only"
+                Mode.FULL -> "full"
             })
             put("listen_host", listenHost)
             put("listen_port", listenPort)
@@ -169,6 +182,9 @@ data class MhrvConfig(
             put("parallel_relay", parallelRelay)
             if (upstreamSocks5.isNotBlank()) {
                 put("upstream_socks5", upstreamSocks5.trim())
+            }
+            if (passthroughHosts.isNotEmpty()) {
+                put("passthrough_hosts", JSONArray().apply { passthroughHosts.forEach { put(it) } })
             }
 
             // Phone-scoped scan defaults. We don't expose these in the UI
@@ -231,6 +247,7 @@ object ConfigStore {
             MhrvConfig(
                 mode = when (obj.optString("mode", "apps_script")) {
                     "google_only" -> Mode.GOOGLE_ONLY
+                    "full" -> Mode.FULL
                     else -> Mode.APPS_SCRIPT
                 },
                 listenHost = obj.optString("listen_host", "127.0.0.1"),
@@ -245,6 +262,9 @@ object ConfigStore {
                 logLevel = obj.optString("log_level", "info"),
                 parallelRelay = obj.optInt("parallel_relay", 1),
                 upstreamSocks5 = obj.optString("upstream_socks5", ""),
+                passthroughHosts = obj.optJSONArray("passthrough_hosts")?.let { arr ->
+                    buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
+                }?.filter { it.isNotBlank() }.orEmpty(),
                 connectionMode = when (obj.optString("connection_mode", "vpn_tun")) {
                     "proxy_only" -> ConnectionMode.PROXY_ONLY
                     else -> ConnectionMode.VPN_TUN  // default for unknown/missing

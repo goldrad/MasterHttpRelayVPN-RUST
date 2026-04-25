@@ -5,6 +5,7 @@
 [![CI](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/actions/workflows/release.yml/badge.svg)](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/github/license/therealaleph/MasterHttpRelayVPN-RUST?color=blue)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/therealaleph/MasterHttpRelayVPN-RUST?style=flat&logo=github)](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/stargazers)
+[![Support](https://img.shields.io/badge/❤️_Support-sh1n.org-red?style=flat)](https://sh1n.org/donate)
 
 Rust port of [@masterking32's MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN). **All credit for the original idea and the Python implementation goes to [@masterking32](https://github.com/masterking32).** This is a faithful reimplementation of the `apps_script` mode, packaged as two tiny binaries (CLI + desktop UI) with no runtime dependencies.
 
@@ -12,7 +13,9 @@ Free DPI bypass via Google Apps Script as a remote relay, with TLS SNI concealme
 
 > **Heads up on authorship:** the bulk of this Rust port was written with [Anthropic's Claude](https://claude.com) driving, reviewed by a human on every commit. Bug reports, fixes, and contributions are all welcome — see the [issues page](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues).
 
-**[English Guide](#setup-guide)** | **[راهنمای فارسی](#راهنمای-فارسی)**
+**[Quick Start (English)](SF_README.md#quick-start)** | **[English Guide](#setup-guide)** | **[راهنمای خلاصه فارسی](SF_README.md#راهنمای-خلاصه-فارسی)** | **[راهنمای کامل فارسی](#راهنمای-فارسی)**
+
+> **New here?** The Quick Start versions are short, plain-language, and cover the most common questions. The full guides have everything else (config options, full tunnel mode, OpenWRT, security notes).
 
 ## Why this exists
 
@@ -160,7 +163,7 @@ Firefox keeps its own cert store; the installer also drops the CA into Firefox's
 
 Open the UI and fill in the form:
 
-- **Apps Script ID** — the Deployment ID from Step 1. Comma-separate multiple IDs for round-robin rotation across several deployments (higher quota, more throughput).
+- **Apps Script ID** — the Deployment ID from Step 1. Add multiple IDs (one per line in the UI, or a JSON array in `config.json`) for higher quota **and** lower latency. In `apps_script` mode, IDs are round-robined. In `full` mode, each deployment gets its own pool of 30 concurrent requests (the Apps Script per-account limit), so more IDs = more total throughput (see [Full tunnel mode](#full-tunnel-mode) below).
 - **Auth key** — the same secret you set in `Code.gs`.
 - **Google IP** — `216.239.38.120` is a solid default. Use the **scan** button to probe for a faster one from your network.
 - **Front domain** — keep `www.google.com`.
@@ -262,6 +265,55 @@ Example config fragment (both UI and JSON):
 
 HTTP/HTTPS continues to route through the Apps Script relay (no change), and the SNI-rewrite tunnel for `google.com` / `youtube.com` / etc. keeps bypassing both — so YouTube stays as fast as before while Telegram gets a real tunnel.
 
+## Full tunnel mode
+
+Full tunnel mode (`"mode": "full"`) routes **all** traffic end-to-end through Apps Script and a remote [tunnel-node](tunnel-node/) — no MITM certificate needed. The trade-off is higher latency per request (every byte goes Apps Script → tunnel-node → destination), but it works for every protocol and every app without CA installation.
+
+### How deployment IDs affect performance
+
+Each Apps Script batch request takes ~2 seconds round-trip. In full mode, `mhrv-rs` runs a **pipelined batch multiplexer** that fires multiple batch requests concurrently without waiting for the previous one to return. Each deployment ID (= one Google account) gets its own concurrency pool of **30 in-flight requests** — matching the Apps Script per-account execution limit.
+
+```
+max_concurrent = 30 × number_of_deployment_ids
+```
+
+| Deployments | Concurrent requests | Notes |
+|-------------|-------------------|-------|
+| 1 | 30 | Single account — plenty for light browsing |
+| 3 | 90 | Good for daily use |
+| 6 | 180 | Recommended for heavy use |
+| 12 | 360 | Multi-account power setup |
+
+More deployments = more total concurrency = lower per-session latency. Each batch round-robins across your deployment IDs, so the load is spread evenly and you're less likely to hit a single deployment's quota ceiling.
+
+**Resource guards** keep things safe:
+- **50 ops max** per batch — if more sessions are active, the mux splits into multiple batches
+- **4 MB payload cap** per batch — well under Apps Script's 50 MB limit
+- **30 s timeout** per batch — a slow/dead target can't block other sessions forever
+
+### Quick start
+
+1. Deploy [`CodeFull.gs`](assets/apps_script/CodeFull.gs) as a **Web App deployment** on each Google account (same steps as `Code.gs`, but use the full-mode script that forwards to your tunnel-node). Use **one deployment per Google account** — the 30-concurrent-request limit is per account, so multiple deployments on the same account share the same pool and don't add concurrency. To scale, add more accounts:
+   - **Solo use** → 1–2 accounts is plenty
+   - **Shared with ~3 people** → 3 accounts
+   - **Shared with a group** → one account per heavy user
+2. Deploy the [tunnel-node](tunnel-node/) on a VPS. The fastest path is the prebuilt Docker image:
+   ```bash
+   docker run -d --name mhrv-tunnel --restart unless-stopped \
+     -p 8080:8080 -e TUNNEL_AUTH_KEY=your-strong-secret \
+     ghcr.io/therealaleph/mhrv-tunnel-node:latest
+   ```
+   Multi-arch (linux/amd64 + linux/arm64), runs as a non-root user, ~32 MB compressed. Pin a version tag (`:1.5.0`) for production. See [tunnel-node/README.md](tunnel-node/README.md) for Cloud Run, docker-compose, and source-build alternatives.
+3. Set `"mode": "full"` in your config with all deployment IDs:
+
+```json
+{
+  "mode": "full",
+  "script_id": ["id1", "id2", "id3", "id4", "id5", "id6"],
+  "auth_key": "your-secret"
+}
+```
+
 ## Running on OpenWRT (or any musl distro)
 
 The `*-linux-musl-*` archives ship a fully static CLI that runs on OpenWRT, Alpine, and any libc-less Linux userland. Put the binary on the router and start it as a service:
@@ -361,6 +413,7 @@ These are inherent to the Apps Script + domain-fronting approach, not bugs in th
 - `auth_key` between the client and the Apps Script relay is a shared secret you pick. The server-side `Code.gs` rejects requests without a matching key.
 - Traffic between your machine and Google's edge is standard TLS 1.3.
 - What Google can see: the destination URL and headers of each request (because Apps Script fetches on your behalf). This is the same trust model as any hosted proxy — if that's not acceptable, use a self-hosted VPN instead.
+- **IP exposure caveat (`apps_script` mode):** v1.2.9 strips every `X-Forwarded-For` / `X-Real-IP` / `Forwarded` / `Via` / `CF-Connecting-IP` / `True-Client-IP` / `Fastly-Client-IP` and ~10 related identity-revealing headers from your outbound request before it reaches Apps Script (issue #104). What this **does not** cover: whatever Google's own infrastructure may add when its Apps Script runtime makes the subsequent `UrlFetchApp.fetch()` to the target site. That second leg is server-side, outside this client's control — so the destination server sees a Google datacenter IP, but there is no public guarantee Google never propagates the original caller's IP in some internal header chain. If your threat model requires that the destination site cannot under any circumstances learn your IP, **use Full Tunnel mode** (traffic exits from your own VPS, only the VPS IP is exposed end-to-end). `apps_script` mode remains fine for bypassing DPI / reaching blocked sites where "seen by Google" is acceptable. Raised in [#148](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/148).
 
 ## License
 
@@ -369,6 +422,14 @@ MIT. See [LICENSE](LICENSE).
 ## Credit
 
 Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@masterking32](https://github.com/masterking32). The idea, the Google Apps Script protocol, the proxy architecture, and the ongoing maintenance are all his. This Rust port exists purely to make client-side distribution easier.
+
+## Support this project
+
+If `mhrv-rs` has been useful to you and you'd like to support continued development:
+
+### [❤️ Support on sh1n.org](https://sh1n.org/donate)
+
+Donations cover hosting, self-hosted CI runner costs, and continued maintenance. Starring the repo also helps signal that the project is worth keeping alive.
 
 ---
 
@@ -569,6 +630,37 @@ Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@mast
 ۴. اگر نام جدیدی می‌خواهید اضافه کنید، در کادر پایین نام را بنویسید و **`+ Add`** بزنید — خودکار تست می‌شود
 ۵. با **`Save config`** در پنجرهٔ اصلی ذخیره کنید
 
+### حالت تونل کامل (Full tunnel mode)
+
+حالت `"mode": "full"` **تمام** ترافیک را سرتاسر از طریق `Apps Script` و یک [tunnel-node](tunnel-node/) روی سرور شما عبور می‌دهد — **بدون نیاز به نصب گواهی `MITM`**. تنها هزینه‌اش تأخیر بیشتر است (هر بایت از مسیر `Apps Script → tunnel-node → مقصد` می‌رود)، اما برای هر پروتکل و هر برنامه بدون نصب `CA` کار می‌کند.
+
+**سریع‌ترین راه راه‌اندازی `tunnel-node` روی `VPS`:** ایمیج آمادهٔ `Docker`:
+
+```bash
+docker run -d --name mhrv-tunnel --restart unless-stopped \
+  -p 8080:8080 -e TUNNEL_AUTH_KEY=رمز_قوی_شما \
+  ghcr.io/therealaleph/mhrv-tunnel-node:latest
+```
+
+`multi-arch` (هم `linux/amd64` و هم `linux/arm64`)، اجرا با کاربر غیر `root`، حدود ۳۲ مگابایت فشرده. برای محیط production نسخهٔ مشخص (`:1.5.0`) را pin کنید. راهنمای کامل (شامل `Cloud Run`، `docker-compose`، و بیلد از سورس) در [`tunnel-node/README.md`](tunnel-node/README.md) هست.
+
+#### چرا تعداد `Deployment ID` مهم است؟
+
+هر درخواست دسته‌ای (`batch`) به `Apps Script` حدود ۲ ثانیه طول می‌کشد. در حالت `full`، برنامه یک **لولهٔ موازی** (`pipeline`) اجرا می‌کند که چند درخواست دسته‌ای را همزمان می‌فرستد بدون اینکه منتظر پاسخ قبلی بماند. هر `Deployment ID` (= یک حساب گوگل) حوضچهٔ همزمانی مخصوص خودش با **۳۰ درخواست همزمان** دارد — مطابق سقف اجرای همزمان `Apps Script` به ازای هر حساب.
+
+```
+حداکثر همزمانی = ۳۰ × تعداد Deployment IDها
+```
+
+| تعداد Deployment | درخواست‌های همزمان | |
+|-----------------|-------------------|---|
+| ۱ | ۳۰ | یک حساب — برای مرور سبک کافیست |
+| ۳ | ۹۰ | مناسب استفادهٔ روزانه |
+| ۶ | ۱۸۰ | توصیه‌شده برای استفادهٔ سنگین |
+| ۱۲ | ۳۶۰ | چند حساب — حداکثر توان |
+
+بیشتر `Deployment` = بیشتر همزمانی = تأخیر کمتر برای هر نشست. هر دسته بین `ID`ها چرخش می‌کند (`round-robin`)، پس بار به‌طور یکنواخت توزیع می‌شود.
+
 ### اجرا روی OpenWRT (روتر)
 
 اگر می‌خواهید برنامه را روی روترتان اجرا کنید تا همهٔ دستگاه‌های شبکه از آن استفاده کنند، آرشیو `mhrv-rs-linux-musl-*.tar.gz` را دانلود کنید (این نسخه فایل اجرایی استاتیک دارد و بدون نصب هیچ وابستگی روی روتر کار می‌کند).
@@ -623,7 +715,7 @@ logread -e mhrv-rs -f
 - **لینوکس:** فایل `/usr/local/share/ca-certificates/mhrv-rs.crt` را حذف و `sudo update-ca-certificates` اجرا کنید
 
 **چند `Deployment ID` لازم دارم؟**
-یکی برای استفادهٔ عادی کافی است. سهمیهٔ روزانه `UrlFetchApp` برای حساب رایگان گوگل **۲۰٬۰۰۰ درخواست در روز** است (برای `Workspace` پولی ۱۰۰٬۰۰۰)، با محدودیت پاسخ ۵۰ مگابایت به ازای هر `fetch`. برای اکثر کاربران چند ساعت یوتیوب هم با یک `Deployment` کافی است. اگر مصرف بالا دارید، در حساب‌های گوگل دیگر `Deployment` بسازید و همهٔ `Deployment ID`ها را در فیلد `Apps Script ID(s)` یک در هر خط وارد کنید — برنامه خودکار بینشان می‌چرخد. مرجع: <https://developers.google.com/apps-script/guides/services/quotas>
+یکی برای استفادهٔ عادی کافی است. سهمیهٔ روزانه `UrlFetchApp` برای حساب رایگان گوگل **۲۰٬۰۰۰ درخواست در روز** است (برای `Workspace` پولی ۱۰۰٬۰۰۰)، با محدودیت پاسخ ۵۰ مگابایت به ازای هر `fetch`. از هر حساب گوگل **فقط یک `Deployment`** بسازید — سقف ۳۰ درخواست همزمان به ازای هر حساب است، پس چند `Deployment` روی یک حساب همزمانی اضافه نمی‌کند. برای افزایش همزمانی یا سهمیهٔ روزانه، در حساب‌های گوگل دیگر `Deployment` بسازید — هر حساب سهمیهٔ ۲۰ هزار درخواستی و ۳۰ اجرای همزمان خودش را دارد. همهٔ `ID`ها را در فیلد `Apps Script ID(s)` وارد کنید — برنامه خودکار بینشان می‌چرخد. مرجع: <https://developers.google.com/apps-script/guides/services/quotas>
 
 **یوتوب کار می‌کند؟ ویدیو پخش می‌شود؟**
 صفحهٔ یوتوب سریع باز می‌شود (چون مستقیم از لبهٔ گوگل می‌آید). اما `chunk`های ویدیوی اصلی از `googlevideo.com` از طریق `Apps Script` می‌آیند و روزانه سهمیه دارند. برای تماشای گاه‌به‌گاه خوب است، برای ۱۰۸۰p پخش طولانی دردناک.
@@ -668,10 +760,19 @@ logread -e mhrv-rs -f
 - `auth_key` یک رمز اختصاصی بین شما و اسکریپت شماست. کد سرور هر درخواستی را که این رمز را نداشته باشد رد می‌کند
 - ترافیک بین شما و گوگل، `TLS 1.3` استاندارد است
 - آنچه گوگل می‌بیند: آدرس `URL` و هدرهای درخواست شما (چون `Apps Script` به‌جای شما `fetch` می‌کند). این همان سطح اعتماد هر پروکسی میزبانی‌شده است — اگر قابل قبول نیست، از `VPN` روی سرور شخصی خودتان استفاده کنید
+- **هشدار افشای `IP` در حالت `apps_script`:** نسخهٔ ۱.۲.۹ همهٔ هدرهای شناسایی‌کننده (`X-Forwarded-For`، `X-Real-IP`، `Forwarded`، `Via`، `CF-Connecting-IP`، `True-Client-IP`، `Fastly-Client-IP` و ~۱۰ هدر مشابه) را از درخواست خروجی سمت کلاینت قبل از رسیدن به `Apps Script` حذف می‌کند ([#104](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/104)). اما آنچه این پوشش نمی‌دهد: هر هدری که زیرساخت خود گوگل ممکن است به درخواست بعدی `UrlFetchApp.fetch()` از کلاینت اضافه کند، در اختیار این برنامه نیست. سرور مقصد `IP` دیتاسنتر گوگل را می‌بیند، اما هیچ تعهد عمومی از گوگل وجود ندارد که `IP` واقعی کاربر در زنجیرهٔ هدرهای داخلی منتشر نمی‌شود. اگر مدل تهدید شما این است که سرور مقصد تحت هیچ شرایطی نباید `IP` شما را ببیند، **از حالت `full` (تونل کامل) استفاده کنید** (ترافیک از `VPS` شخصی شما خارج می‌شود، فقط `IP` آن `VPS` دیده می‌شود). حالت `apps_script` برای دور زدن `DPI` و دسترسی به سایت‌های فیلترشده کاملاً مناسب است، اما فرض می‌کند «دیده‌شدن توسط گوگل» قابل قبول است. مطرح‌شده در [#148](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/148).
 
 ### اعتبار
 
 پروژهٔ اصلی: <https://github.com/masterking32/MasterHttpRelayVPN> توسط [@masterking32](https://github.com/masterking32). ایده، پروتکل `Apps Script`، و معماری پروکسی همه متعلق به ایشان است. این پورت `Rust` فقط برای ساده‌تر کردن توزیع سمت کلاینت درست شده.
+
+### حمایت از پروژه
+
+اگر `mhrv-rs` برای شما مفید بوده و می‌خواهید از ادامهٔ توسعه حمایت کنید:
+
+### [❤️ حمایت در sh1n.org](https://sh1n.org/donate)
+
+کمک‌ها صرف هزینه‌های میزبانی، سرور `CI` اختصاصی، و ادامهٔ نگهداری پروژه می‌شود. ستاره دادن به ریپو هم یک راه رایگان برای نشان دادن اینه که پروژه ارزش ادامه دادن داره.
 
 </div>
 1234

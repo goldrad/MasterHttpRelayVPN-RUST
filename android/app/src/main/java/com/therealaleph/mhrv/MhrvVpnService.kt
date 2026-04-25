@@ -90,22 +90,16 @@ class MhrvVpnService : VpnService() {
         // `ForegroundServiceDidNotStartInTimeException`. Every `stopSelf()`
         // path below MUST therefore happen after a `startForeground()`
         // call — otherwise the user-visible symptom is "the app crashes
-        // the instant I tap Start". See issue #73: user configured
-        // google_only mode (no deployment ID needed), which tripped the
-        // old early-return-before-startForeground branch.
-        //
-        // We call startForeground immediately here with the notification
-        // used by the normal running state; if we bail out below, we
-        // tear the foreground service down in an orderly way.
+        // the instant I tap Start". See issue #73.
         startForeground(NOTIF_ID, buildNotif(cfg.listenPort))
 
-        // Deployment ID + auth key are only required in apps_script mode.
-        // google_only mode (bootstrap / Telegram-only use cases) runs
-        // with neither. Closes #73 regression where google_only users
-        // hit this branch and crashed on startForeground timeout.
-        val needsAppsScriptCreds = cfg.mode == Mode.APPS_SCRIPT
-        if (needsAppsScriptCreds && (!cfg.hasDeploymentId || cfg.authKey.isBlank())) {
-            Log.e(TAG, "Config is incomplete — can't start proxy in apps_script mode")
+        // Deployment ID + auth key are required for apps_script and full
+        // modes — both talk to Apps Script. Only google_only (bootstrap)
+        // runs without them. Closes #73 regression where google_only
+        // users hit this branch and crashed on startForeground timeout.
+        val needsCreds = cfg.mode != Mode.GOOGLE_ONLY
+        if (needsCreds && (!cfg.hasDeploymentId || cfg.authKey.isBlank())) {
+            Log.e(TAG, "Config is incomplete — deployment ID + auth key required for ${cfg.mode}")
             try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
             stopSelf()
             return
@@ -143,6 +137,7 @@ class MhrvVpnService : VpnService() {
         // backgrounding. Issue #37.
         if (cfg.connectionMode == ConnectionMode.PROXY_ONLY) {
             Log.i(TAG, "PROXY_ONLY mode: listeners up, skipping VpnService/TUN")
+            VpnState.setProxyHandle(proxyHandle)
             VpnState.setRunning(true)
             return
         }
@@ -165,45 +160,61 @@ class MhrvVpnService : VpnService() {
             .addRoute("0.0.0.0", 0)
             .addDnsServer("1.1.1.1")
             .setBlocking(false)
-        try {
-            builder.addDisallowedApplication(packageName)
-        } catch (e: Throwable) {
-            // Shouldn't happen for our own package, but don't hard-fail.
-            Log.w(TAG, "addDisallowedApplication failed: ${e.message}")
-        }
 
-        // Apply user-chosen app splitting on top of the mandatory
-        // self-exclusion above.
+        // Apply user-chosen app splitting. The VpnService API treats
+        // addAllowedApplication and addDisallowedApplication as mutually
+        // exclusive — calling both on one Builder throws
+        // IllegalArgumentException at establish() time, which is the bug
+        // that manifested as "ONLY mode tunnels everything" (establish()
+        // failed silently and the fallback never routed correctly).
         //
-        //   ALL    — no extra restriction; every other app routes through
-        //            us. Matches pre-splitting behaviour.
-        //   ONLY   — allow-list. addAllowedApplication() for each chosen
-        //            package; anything missing from the list bypasses the
-        //            VPN on the OS-native route. Note that ONLY and the
-        //            mandatory self-exclude are mutually exclusive in the
-        //            VpnService API, so if the user also put us in the
-        //            allow-list we skip the self-exclude (it's already
-        //            implicit via "we're not in the list").
-        //   EXCEPT — deny-list. addDisallowedApplication() for each chosen
-        //            package, additive with our self-exclude.
+        // ALL / EXCEPT: add the mandatory self-exclude (packageName) via
+        // addDisallowedApplication so our own proxy's outbound to
+        // google_ip doesn't loop through the TUN.
+        // ONLY: self-exclusion is implicit — we're not in the allow-list.
         //
         // Packages that are not installed (leftover selections from a
         // previous device) throw PackageManager.NameNotFoundException —
         // we log and skip rather than aborting the whole VPN start.
         when (cfg.splitMode) {
-            SplitMode.ALL -> { /* no-op */ }
+            SplitMode.ALL -> {
+                try {
+                    builder.addDisallowedApplication(packageName)
+                } catch (e: Throwable) {
+                    Log.w(TAG, "addDisallowedApplication(self) failed: ${e.message}")
+                }
+            }
             SplitMode.ONLY -> {
                 if (cfg.splitApps.isEmpty()) {
                     Log.w(TAG, "ONLY mode with empty splitApps list — no app would get the VPN; falling back to ALL")
+                    try {
+                        builder.addDisallowedApplication(packageName)
+                    } catch (_: Throwable) {}
                 } else {
+                    var allowed = 0
                     for (pkg in cfg.splitApps) {
-                        try { builder.addAllowedApplication(pkg) } catch (e: Throwable) {
+                        if (pkg == packageName) continue  // can't tunnel ourselves
+                        try {
+                            builder.addAllowedApplication(pkg)
+                            allowed++
+                        } catch (e: Throwable) {
                             Log.w(TAG, "addAllowedApplication($pkg) failed: ${e.message}")
                         }
+                    }
+                    if (allowed == 0) {
+                        Log.w(TAG, "ONLY mode had no usable apps — falling back to ALL")
+                        try {
+                            builder.addDisallowedApplication(packageName)
+                        } catch (_: Throwable) {}
                     }
                 }
             }
             SplitMode.EXCEPT -> {
+                try {
+                    builder.addDisallowedApplication(packageName)
+                } catch (e: Throwable) {
+                    Log.w(TAG, "addDisallowedApplication(self) failed: ${e.message}")
+                }
                 for (pkg in cfg.splitApps) {
                     if (pkg == packageName) continue  // already self-excluded above
                     try { builder.addDisallowedApplication(pkg) } catch (e: Throwable) {
@@ -264,6 +275,7 @@ class MhrvVpnService : VpnService() {
         // to observe. Only flipped true once everything above succeeded —
         // if we'd flipped it earlier the button would light up green for
         // a failed-to-establish run.
+        VpnState.setProxyHandle(proxyHandle)
         VpnState.setRunning(true)
     }
 
@@ -345,6 +357,7 @@ class MhrvVpnService : VpnService() {
         }
         // Flip UI state last — the button reverts to Connect only after
         // the native-side cleanup actually happened, not optimistically.
+        VpnState.setProxyHandle(0L)
         VpnState.setRunning(false)
         Log.i(TAG, "teardown: done")
     }

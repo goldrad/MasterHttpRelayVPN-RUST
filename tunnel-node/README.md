@@ -31,7 +31,44 @@ gcloud run deploy tunnel-node \
   --max-instances 1
 ```
 
-### Docker (any VPS)
+### Docker — prebuilt image (any VPS)
+
+The fastest path. Pull a prebuilt image and run it; no Rust toolchain needed on the VPS.
+
+```bash
+# Generate a strong secret. Save it — you'll paste the same value into CodeFull.gs.
+SECRET=$(openssl rand -hex 24)
+echo "Your TUNNEL_AUTH_KEY: $SECRET"
+
+# Pull + run.
+docker run -d \
+  --name mhrv-tunnel \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -e TUNNEL_AUTH_KEY="$SECRET" \
+  ghcr.io/therealaleph/mhrv-tunnel-node:latest
+```
+
+The `:latest` tag tracks the most recent release. To pin a specific version (recommended for production), use `ghcr.io/therealaleph/mhrv-tunnel-node:v1.5.0` (or whatever release you're on). Image is available for `linux/amd64` and `linux/arm64`.
+
+**docker-compose.yml** if you prefer:
+
+```yaml
+services:
+  tunnel:
+    image: ghcr.io/therealaleph/mhrv-tunnel-node:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      TUNNEL_AUTH_KEY: ${TUNNEL_AUTH_KEY}
+```
+
+Then `TUNNEL_AUTH_KEY=your-secret docker compose up -d`.
+
+### Docker — build from source
+
+If you'd rather build the image yourself (or add custom changes):
 
 ```bash
 cd tunnel-node
@@ -79,3 +116,11 @@ TUNNEL_AUTH_KEY=your-secret PORT=8080 ./target/release/tunnel-node
 ```
 
 ### Health check: `GET /health` → `ok`
+
+## Performance: deployment count and pipeline depth
+
+The mhrv-rs client runs a pipelined batch multiplexer in full mode. Each Apps Script round-trip takes ~2s, so the client fires multiple batch requests concurrently — the pipeline depth equals the number of configured script deployment IDs (minimum 2, no upper cap).
+
+More deployments = more concurrent batches hitting the tunnel-node = lower per-session latency. With 6 deployments, a new batch arrives every ~0.3s instead of every 2s.
+
+The tunnel-node itself is stateless per-request (sessions are keyed by UUID), so it handles concurrent batches naturally. For best results, deploy 3–12 Apps Script instances across separate Google accounts and list all their deployment IDs in the client config.

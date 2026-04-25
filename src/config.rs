@@ -22,6 +22,7 @@ pub enum ConfigError {
 pub enum Mode {
     AppsScript,
     GoogleOnly,
+    Full,
 }
 
 impl Mode {
@@ -29,6 +30,7 @@ impl Mode {
         match self {
             Mode::AppsScript => "apps_script",
             Mode::GoogleOnly => "google_only",
+            Mode::Full => "full",
         }
     }
 }
@@ -127,6 +129,40 @@ pub struct Config {
     /// features. Turn on and observe.
     #[serde(default)]
     pub normalize_x_graphql: bool,
+
+    /// Route YouTube traffic through the Apps Script relay instead of
+    /// the direct SNI-rewrite tunnel. Ported from upstream Python
+    /// `youtube_via_relay` (issue #102).
+    ///
+    /// Why this exists: when YouTube is SNI-rewritten to `google_ip`
+    /// with `SNI=www.google.com`, Google's frontend can enforce
+    /// SafeSearch / Restricted Mode based on the SNI → some videos show
+    /// as "restricted." Routing through Apps Script bypasses that check
+    /// (it hits YouTube from Google's own backend, not via www.google.com
+    /// SNI) but introduces the UrlFetchApp User-Agent and quota costs.
+    ///
+    /// Trade-off: enabling removes SafeSearch-on-SNI, adds `User-Agent:
+    /// Google-Apps-Script` header and counts YouTube traffic against
+    /// your Apps Script quota. Off by default.
+    #[serde(default)]
+    pub youtube_via_relay: bool,
+
+    /// User-configurable passthrough list. Any host whose name matches
+    /// one of these entries bypasses the Apps Script relay entirely and
+    /// is plain-TCP-passthroughed (optionally through `upstream_socks5`).
+    ///
+    /// Accepts exact hostnames ("example.com") and leading-dot suffixes
+    /// (".internal.example" matches "a.b.internal.example"). Matches are
+    /// case-insensitive.
+    ///
+    /// Dispatched BEFORE SNI-rewrite and Apps Script, so a passthrough
+    /// entry wins over the default Google-edge routing. Useful for
+    /// sites where you already have reachability without the relay
+    /// (saving Apps Script quota) or for hosts that break under MITM.
+    ///
+    /// Issues #39, #127.
+    #[serde(default)]
+    pub passthrough_hosts: Vec<String>,
 }
 
 fn default_fetch_ips_from_api() -> bool { false }
@@ -164,7 +200,7 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         let mode = self.mode_kind()?;
-        if mode == Mode::AppsScript {
+        if mode == Mode::AppsScript || mode == Mode::Full {
             if self.auth_key.trim().is_empty() || self.auth_key == "CHANGE_ME_TO_A_STRONG_SECRET" {
                 return Err(ConfigError::Invalid(
                     "auth_key must be set to a strong secret".into(),
@@ -201,8 +237,9 @@ impl Config {
         match self.mode.as_str() {
             "apps_script" => Ok(Mode::AppsScript),
             "google_only" => Ok(Mode::GoogleOnly),
+            "full" => Ok(Mode::Full),
             other => Err(ConfigError::Invalid(format!(
-                "unknown mode '{}' (expected 'apps_script' or 'google_only')",
+                "unknown mode '{}' (expected 'apps_script', 'google_only', or 'full')",
                 other
             ))),
         }
@@ -291,6 +328,28 @@ mod tests {
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_full_mode() {
+        let s = r#"{
+            "mode": "full",
+            "auth_key": "MY_SECRET_KEY_123",
+            "script_id": "ABCDEF"
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.mode_kind().unwrap(), Mode::Full);
+    }
+
+    #[test]
+    fn full_mode_requires_script_id() {
+        let s = r#"{
+            "mode": "full",
+            "auth_key": "SECRET"
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

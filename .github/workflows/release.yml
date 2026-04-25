@@ -4,9 +4,31 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual re-trigger for the case where one matrix job (e.g. mipsel-softfloat)
+  # failed on the original tag push and we've since pushed the build fix to
+  # main but can't force-move the immutable tag (tag protection rule). Run
+  # this workflow manually with `version` set to the existing release tag —
+  # the build matrix runs against the current main, artifacts are uploaded
+  # to the matching release page, and the release-notes step is a no-op
+  # (release already exists). Pair with `gh variable set
+  # TELEGRAM_NOTIFY_ENABLED --body false` before dispatch if you don't want
+  # the channel re-pinged for what's effectively the same release.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Existing release tag to upload to (without the leading v). Example: 1.4.0'
+        required: true
+        type: string
 
 permissions:
   contents: write
+  # `tunnel-docker` job pushes to ghcr.io/therealaleph/mhrv-tunnel-node.
+  # `packages: write` is required by docker/login-action when authenticating
+  # to GHCR with the workflow's auto-provisioned GITHUB_TOKEN. Granted at
+  # the workflow level so the matrix-build job (which doesn't need it) and
+  # the release job (which doesn't need it) both still have a single
+  # well-scoped permissions block.
+  packages: write
 
 # Runner strategy:
 #   - Linux + Android + mipsel:       self-hosted (mhrv-hetzner-*, Hetzner
@@ -81,6 +103,26 @@ jobs:
     continue-on-error: ${{ matrix.mipsel_softfloat == true }}
 
     steps:
+      # Heal any root-owned leftovers from a previous mipsel docker
+      # build that failed before its post-step chown could run. The
+      # docker container writes target/ as root, and if cargo errors
+      # inside the container the outer `sudo chown -R` line never
+      # executes (bash -e exits on the docker non-zero), leaving root-
+      # owned files that fail every subsequent `actions/checkout@v4`
+      # workspace clean with `EACCES: permission denied unlink`. This
+      # step is a no-op on a clean runner, so cheap to keep always-on.
+      # Self-hosted only; GitHub-hosted runners get a fresh VM each run.
+      - name: Pre-checkout — clean root-owned files (self-hosted only)
+        if: contains(matrix.os, 'self-hosted')
+        run: |
+          if [ -d "$GITHUB_WORKSPACE/target" ]; then
+            sudo rm -rf "$GITHUB_WORKSPACE/target" || true
+          fi
+          # Stale .rustc_info.json at the workspace root is the
+          # specific file `actions/checkout` errors on; nuke any
+          # other root-owned scraps that may be sitting there too.
+          sudo find "$GITHUB_WORKSPACE" -maxdepth 2 -uid 0 -exec rm -rf {} + 2>/dev/null || true
+
       - uses: actions/checkout@v4
 
       # Skip the host-level rustup install for mipsel-softfloat — that
@@ -219,6 +261,16 @@ jobs:
         # silently at the post-docker chown. Heredoc-style single
         # quotes preserve newlines verbatim; no comment collapse.
         run: |
+          # Always chown back, even if docker exits non-zero. The previous
+          # form (`docker run …; sudo chown …`) ran chown only on success
+          # because bash -e short-circuits on the docker failure; that
+          # left target/ root-owned and broke `actions/checkout@v4` on
+          # every subsequent self-hosted run with EACCES on
+          # target/.rustc_info.json. The `trap … EXIT` runs the chown
+          # whether docker succeeded or failed, so a transient mipsel
+          # compile regression never poisons the runner workspace.
+          set +e
+          trap 'sudo chown -R "$(id -u):$(id -g)" target 2>/dev/null || true' EXIT
           docker run --rm -v "$PWD":/src -w /src \
             -e RUSTFLAGS='-C target-feature=+soft-float' \
             messense/rust-musl-cross:mipsel-musl \
@@ -237,7 +289,11 @@ jobs:
                 --target mipsel-unknown-linux-musl \
                 --bin mhrv-rs
             '
-          sudo chown -R "$(id -u):$(id -g)" target
+          rc=$?
+          # `trap … EXIT` will fire the chown on shell exit — the explicit
+          # exit here just propagates the docker exit code as the step
+          # status (success vs continue-on-error path).
+          exit $rc
 
       # UI build: we try to build the UI binary on every platform. If it fails
       # on cross-compile for linux-arm64 (missing arm64 system libs cross),
@@ -277,7 +333,12 @@ jobs:
       - name: Build macOS .app bundle
         if: runner.os == 'macOS'
         run: |
-          VER="${GITHUB_REF#refs/tags/v}"
+          # Tag push: $GITHUB_REF == "refs/tags/v1.4.0", strip "refs/tags/v".
+          # workflow_dispatch: inputs.version comes in as e.g. "1.4.0".
+          # Fall back to ref_name (the bare branch/tag name) and strip a
+          # possible leading "v" so both paths produce the bare version.
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
           ./assets/macos/build-app.sh dist/mhrv-rs-ui "$VER" dist
           # Make a clean zip of just the .app for the release
           cd dist
@@ -375,27 +436,132 @@ jobs:
           chmod +x ./gradlew
           ./gradlew :app:assembleRelease --no-daemon --stacktrace
 
-      - name: Rename APK with version
+      - name: Rename APKs with version
         working-directory: android
         run: |
-          VER="${GITHUB_REF#refs/tags/v}"
-          SRC="app/build/outputs/apk/release/app-release.apk"
-          if [ ! -f "$SRC" ]; then
-            # Some AGP versions name it differently when the release config
-            # can't be auto-signed. Catch that up front with a clear error
-            # instead of a silent missing-artifact later.
-            echo "::error::expected $SRC to exist; actual outputs:"
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+          mkdir -p ../dist
+
+          # With splits.abi enabled in build.gradle.kts (issue #136), AGP
+          # emits:
+          #   app-universal-release.apk       — all 4 ABIs bundled (~50 MB)
+          #   app-arm64-v8a-release.apk       — modern 64-bit ARM (~15 MB)
+          #   app-armeabi-v7a-release.apk     — older 32-bit ARM
+          #   app-x86_64-release.apk          — emulator on Intel Macs / Chromebook
+          #   app-x86-release.apk             — legacy 32-bit Intel emulator
+          #
+          # We publish all of them so users behind narrow / flaky
+          # censorship tunnels can grab the per-ABI APK that matches
+          # their device (~15 MB) instead of the ~50 MB universal.
+          # Universal stays named `mhrv-rs-android-universal-v*.apk` so
+          # existing download links and Telegram mirrors keep working.
+          declare -A ABI_TO_OUTNAME=(
+            ["universal"]="mhrv-rs-android-universal-v${VER}.apk"
+            ["arm64-v8a"]="mhrv-rs-android-arm64-v8a-v${VER}.apk"
+            ["armeabi-v7a"]="mhrv-rs-android-armeabi-v7a-v${VER}.apk"
+            ["x86_64"]="mhrv-rs-android-x86_64-v${VER}.apk"
+            ["x86"]="mhrv-rs-android-x86-v${VER}.apk"
+          )
+
+          missing=0
+          for abi in "${!ABI_TO_OUTNAME[@]}"; do
+            SRC="app/build/outputs/apk/release/app-${abi}-release.apk"
+            if [ -f "$SRC" ]; then
+              cp "$SRC" "../dist/${ABI_TO_OUTNAME[$abi]}"
+              ls -la "../dist/${ABI_TO_OUTNAME[$abi]}"
+            else
+              echo "::warning::missing expected APK: $SRC"
+              missing=$((missing + 1))
+            fi
+          done
+
+          # Require at least the universal — if that's missing something
+          # is genuinely broken and we should fail loud rather than ship
+          # a partial release.
+          if [ ! -f "../dist/mhrv-rs-android-universal-v${VER}.apk" ]; then
+            echo "::error::universal APK missing; actual outputs:"
             find app/build/outputs/apk -type f -name '*.apk' -print
             exit 1
           fi
-          mkdir -p ../dist
-          cp "$SRC" "../dist/mhrv-rs-android-universal-v${VER}.apk"
+          if [ "$missing" -gt 0 ]; then
+            echo "::warning::$missing per-ABI APK(s) missing; continuing with universal + whatever built"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: mhrv-rs-android-universal
           path: dist/*.apk
           if-no-files-found: error
+
+  # Build + publish the tunnel-node Docker image to GHCR. Issue: every
+  # full-mode user has to set up tunnel-node on a VPS, and "rustup +
+  # cargo build --release" on a 1GB VPS is non-trivial — fails on memory,
+  # takes 8+ minutes if it works, blocks anyone without Rust experience.
+  # A prebuilt multi-arch image makes deployment a one-liner:
+  #   docker run -d -p 8080:8080 -e TUNNEL_AUTH_KEY=... \
+  #     ghcr.io/therealaleph/mhrv-tunnel-node:latest
+  #
+  # Tags published per release:
+  #   v1.5.0       — exact version pin
+  #   1.5          — auto-following minor
+  #   latest       — most recent release (skipped on workflow_dispatch
+  #                  re-publishes; see `latest` condition below)
+  #
+  # Build platforms: linux/amd64 and linux/arm64. Most VPS providers
+  # (DigitalOcean, Hetzner, Oracle Free Tier) offer arm64 instances at
+  # half price, and the binary works on both.
+  tunnel-docker:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Compute the version string the same way the rest of the workflow
+      # does: tag pushes get it from github.ref_name (e.g. "v1.5.0"),
+      # workflow_dispatch from the explicit `inputs.version` (e.g.
+      # "1.5.0"). Strip a possible leading "v" so the docker tag namespace
+      # is consistent: `:1.5.0`, not `:v1.5.0`.
+      - name: Compute version
+        id: ver
+        run: |
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+          MINOR="${VER%.*}"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "minor=${MINOR}" >> "$GITHUB_OUTPUT"
+          echo "Building docker for v${VER} (minor: ${MINOR})"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build for both amd64 and arm64. `:latest` is only updated on
+      # actual tag pushes — workflow_dispatch re-runs on an existing
+      # version (e.g. for the v1.4.0 mipsel republish) shouldn't move
+      # the latest pointer.
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./tunnel-node
+          file: ./tunnel-node/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/mhrv-tunnel-node:${{ steps.ver.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/mhrv-tunnel-node:${{ steps.ver.outputs.minor }}
+            ${{ github.event_name == 'push' && format('ghcr.io/{0}/mhrv-tunnel-node:latest', github.repository_owner) || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   # release + telegram: lightweight aggregation jobs kept on GH-hosted
   # ubuntu-latest. They only download artifacts and call APIs — no build
@@ -417,10 +583,57 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Compose the GitHub release body from `docs/changelog/v<ver>.md`
+      # so the Releases page tells humans what actually changed —
+      # `generate_release_notes: true` alone produces "Full Changelog:
+      # …compare/v1.x.0...v1.x.1" which is empty when no PRs landed
+      # between tags (e.g. for fix-forward releases like v1.4.1). The
+      # changelog file already exists for every release in our format
+      # (Persian section, then `---`, then English section); we wrap it
+      # with a header and append the auto-generated commit list at the
+      # bottom by NOT setting body_path and instead setting body
+      # directly to changelog_content + (the existing
+      # generate_release_notes flag handles the trailing comparison
+      # link automatically).
+      - name: Compose release body
+        id: relbody
+        run: |
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+          CHANGELOG="docs/changelog/v${VER}.md"
+          if [ ! -f "$CHANGELOG" ]; then
+            echo "::warning::no changelog at $CHANGELOG; release body will fall back to generate_release_notes only"
+            echo "has_changelog=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo 'body<<__RELEASE_BODY_EOF__'
+            # Strip leading HTML comment that documents the file format.
+            sed -e '1{/^<!--/d;}' "$CHANGELOG"
+            echo
+            echo '__RELEASE_BODY_EOF__'
+          } >> "$GITHUB_OUTPUT"
+          echo "has_changelog=true" >> "$GITHUB_OUTPUT"
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
+          # On tag push, action-gh-release defaults tag_name to the
+          # current ref. On workflow_dispatch the ref is `main` (or
+          # whichever branch we dispatched from), which would create a
+          # bogus release named "main"; force the tag explicitly so
+          # artifacts upload to the existing release identified by
+          # `inputs.version`. The leading `v` is preserved (release
+          # tags are `v1.4.0`, not `1.4.0`).
+          tag_name: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
           files: dist/*
+          # Append auto-generated comparison link AFTER our changelog
+          # body — `append_body: true` puts our body first, then the
+          # auto notes. If no changelog file existed, body is empty and
+          # the auto notes carry the whole release-page content (same
+          # behavior as before this change).
+          body: ${{ steps.relbody.outputs.body }}
+          append_body: true
           generate_release_notes: true
 
   # Notify the Persian-speaking Telegram channel with the CI-built
@@ -474,7 +687,8 @@ jobs:
         # 26. Python stdlib has no such wart.
         run: |
           set -euo pipefail
-          VER="${GITHUB_REF#refs/tags/v}"
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
           APK="apk/mhrv-rs-android-universal-v${VER}.apk"
 
           if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then

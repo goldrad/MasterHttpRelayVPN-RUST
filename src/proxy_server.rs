@@ -14,6 +14,7 @@ use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor, TlsConnector};
 use crate::config::{Config, Mode};
 use crate::domain_fronter::DomainFronter;
 use crate::mitm::MitmCertManager;
+use crate::tunnel_client::TunnelMux;
 
 // Domains that are served from Google's core frontend IP pool and therefore
 // respond correctly when we connect to `google_ip` with SNI=`front_domain`
@@ -67,11 +68,27 @@ const SNI_REWRITE_SUFFIXES: &[&str] = &[
     "blogger.com",
 ];
 
-fn matches_sni_rewrite(host: &str) -> bool {
+/// YouTube-family suffixes. Extracted so `youtube_via_relay` config can
+/// pull them out of the SNI-rewrite dispatch at runtime.
+const YOUTUBE_SNI_SUFFIXES: &[&str] = &[
+    "youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+    "ytimg.com",
+];
+
+fn matches_sni_rewrite(host: &str, youtube_via_relay: bool) -> bool {
     let h = host.to_ascii_lowercase();
     let h = h.trim_end_matches('.');
     SNI_REWRITE_SUFFIXES
         .iter()
+        .filter(|s| {
+            // If the user opted into youtube_via_relay, skip YouTube
+            // suffixes so they fall through to the Apps Script relay
+            // path. See config.rs `youtube_via_relay` docs for the
+            // trade-off. Issue #102.
+            !(youtube_via_relay && YOUTUBE_SNI_SUFFIXES.contains(s))
+        })
         .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
 }
 
@@ -109,6 +126,7 @@ pub struct ProxyServer {
     fronter: Option<Arc<DomainFronter>>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
+    tunnel_mux: Option<Arc<TunnelMux>>,
 }
 
 pub struct RewriteCtx {
@@ -118,6 +136,39 @@ pub struct RewriteCtx {
     pub tls_connector: TlsConnector,
     pub upstream_socks5: Option<String>,
     pub mode: Mode,
+    /// If true, YouTube traffic bypasses the SNI-rewrite tunnel and
+    /// goes through the Apps Script relay instead. See config.rs for
+    /// the trade-off. Issue #102.
+    pub youtube_via_relay: bool,
+    /// User-configured hostnames that should skip the relay entirely
+    /// and pass through as plain TCP (optionally via upstream_socks5).
+    /// See config.rs `passthrough_hosts` for matching rules. Issues #39, #127.
+    pub passthrough_hosts: Vec<String>,
+}
+
+/// True if `host` matches any entry in the user's passthrough list.
+/// Match is case-insensitive. Entries match either exactly, or as a
+/// suffix if they start with "." (e.g. ".internal.example" matches
+/// "a.b.internal.example" and the bare "internal.example"). Bare
+/// entries like "example.com" only match the exact hostname — users
+/// who want subdomains included should use ".example.com".
+pub fn matches_passthrough(host: &str, list: &[String]) -> bool {
+    if list.is_empty() {
+        return false;
+    }
+    let h = host.to_ascii_lowercase();
+    let h = h.trim_end_matches('.');
+    list.iter().any(|entry| {
+        let e = entry.trim().trim_end_matches('.').to_ascii_lowercase();
+        if e.is_empty() {
+            return false;
+        }
+        if let Some(suffix) = e.strip_prefix('.') {
+            h == suffix || h.ends_with(&format!(".{}", suffix))
+        } else {
+            h == e
+        }
+    })
 }
 
 impl ProxyServer {
@@ -130,7 +181,7 @@ impl ProxyServer {
         // not try to construct the DomainFronter — it errors on a missing
         // `script_id`, which is exactly the state a bootstrapping user is in.
         let fronter = match mode {
-            Mode::AppsScript => {
+            Mode::AppsScript | Mode::Full => {
                 let f = DomainFronter::new(config).map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::Other, format!("{e}"))
                 })?;
@@ -160,6 +211,8 @@ impl ProxyServer {
             tls_connector,
             upstream_socks5: config.upstream_socks5.clone(),
             mode,
+            youtube_via_relay: config.youtube_via_relay,
+            passthrough_hosts: config.passthrough_hosts.clone(),
         });
 
         let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
@@ -171,6 +224,7 @@ impl ProxyServer {
             fronter,
             mitm,
             rewrite_ctx,
+            tunnel_mux: None, // initialized in run() inside the tokio runtime
         })
     }
 
@@ -178,9 +232,16 @@ impl ProxyServer {
         self.fronter.clone()
     }
     pub async fn run(
-        self,
+        mut self,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<(), ProxyError> {
+        // Initialize TunnelMux inside the runtime (tokio::spawn requires it).
+        if self.rewrite_ctx.mode == Mode::Full {
+            if let Some(f) = self.fronter.as_ref() {
+                self.tunnel_mux = Some(TunnelMux::start(f.clone()));
+            }
+        }
+
         let http_addr = format!("{}:{}", self.host, self.port);
         let socks_addr = format!("{}:{}", self.host, self.socks5_port);
         let http_listener = TcpListener::bind(&http_addr).await?;
@@ -223,9 +284,26 @@ impl ProxyServer {
         let http_fronter = self.fronter.clone();
         let http_mitm = self.mitm.clone();
         let http_ctx = self.rewrite_ctx.clone();
+        let http_mux = self.tunnel_mux.clone();
         let mut http_task = tokio::spawn(async move {
             let mut fd_exhaust_count: u64 = 0;
+            // Track every per-client child task in a JoinSet so that when
+            // this accept task is aborted on shutdown, dropping the JoinSet
+            // aborts the children too. Previously children were bare
+            // `tokio::spawn(...)` handles with no ownership — aborting the
+            // parent accept loop stopped taking new connections but left
+            // in-flight ones running with the OLD config. That manifested
+            // as "hitting Stop in the UI doesn't actually stop anything
+            // already running" (issue #99) and as "changing auth_key and
+            // Start doesn't take effect for domains with a live
+            // keep-alive" because the old DomainFronter stayed alive
+            // inside those child tasks.
+            let mut children: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             loop {
+                // Opportunistic reap so completed children don't pile up
+                // memory on long-running proxies.
+                while children.try_join_next().is_some() {}
+
                 let (sock, peer) = match http_listener.accept().await {
                     Ok(x) => {
                         fd_exhaust_count = 0;
@@ -240,8 +318,9 @@ impl ProxyServer {
                 let fronter = http_fronter.clone();
                 let mitm = http_mitm.clone();
                 let rewrite_ctx = http_ctx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_http_client(sock, fronter, mitm, rewrite_ctx).await {
+                let mux = http_mux.clone();
+                children.spawn(async move {
+                    if let Err(e) = handle_http_client(sock, fronter, mitm, rewrite_ctx, mux).await {
                         tracing::debug!("http client {} closed: {}", peer, e);
                     }
                 });
@@ -251,9 +330,16 @@ impl ProxyServer {
         let socks_fronter = self.fronter.clone();
         let socks_mitm = self.mitm.clone();
         let socks_ctx = self.rewrite_ctx.clone();
+        let socks_mux = self.tunnel_mux.clone();
         let mut socks_task = tokio::spawn(async move {
             let mut fd_exhaust_count: u64 = 0;
+            // Same pattern as http_task above — JoinSet so shutdown
+            // drops in-flight SOCKS5 clients instead of leaving them to
+            // keep running on the stale config.
+            let mut children: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             loop {
+                while children.try_join_next().is_some() {}
+
                 let (sock, peer) = match socks_listener.accept().await {
                     Ok(x) => {
                         fd_exhaust_count = 0;
@@ -268,8 +354,9 @@ impl ProxyServer {
                 let fronter = socks_fronter.clone();
                 let mitm = socks_mitm.clone();
                 let rewrite_ctx = socks_ctx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_socks5_client(sock, fronter, mitm, rewrite_ctx).await {
+                let mux = socks_mux.clone();
+                children.spawn(async move {
+                    if let Err(e) = handle_socks5_client(sock, fronter, mitm, rewrite_ctx, mux).await {
                         tracing::debug!("socks client {} closed: {}", peer, e);
                     }
                 });
@@ -351,6 +438,7 @@ async fn handle_http_client(
     fronter: Option<Arc<DomainFronter>>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
+    tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
     let (head, leftover) = match read_http_head(&mut sock).await? {
         Some(v) => v,
@@ -365,7 +453,7 @@ async fn handle_http_client(
         sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
         sock.flush().await?;
-        dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx).await
+        dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx, tunnel_mux).await
     } else {
         // Plain HTTP proxy request (e.g. `GET http://…`). The Apps Script
         // relay is the only code path that can fulfil this, so in google_only
@@ -397,6 +485,7 @@ async fn handle_socks5_client(
     fronter: Option<Arc<DomainFronter>>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
+    tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
     // RFC 1928 handshake: VER=5, NMETHODS, METHODS...
     let mut hdr = [0u8; 2];
@@ -464,7 +553,7 @@ async fn handle_socks5_client(
         .await?;
     sock.flush().await?;
 
-    dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx).await
+    dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx, tunnel_mux).await
 }
 
 // ---------- Smart dispatch (used by both HTTP CONNECT and SOCKS5) ----------
@@ -473,13 +562,20 @@ fn should_use_sni_rewrite(
     hosts: &std::collections::HashMap<String, String>,
     host: &str,
     port: u16,
+    youtube_via_relay: bool,
 ) -> bool {
     // The SNI-rewrite path expects TLS from the client: it accepts inbound
     // TLS, then opens a second TLS connection to the Google edge with a front
     // SNI. Auto-forcing that path for non-TLS ports (for example a SOCKS5
     // CONNECT to google.com:80) makes the proxy wait for a ClientHello that
     // will never arrive.
-    port == 443 && (matches_sni_rewrite(host) || hosts_override(hosts, host).is_some())
+    //
+    // youtube_via_relay=true removes YouTube suffixes from the match so
+    // YouTube traffic falls through to the Apps Script relay path instead
+    // of the SNI-rewrite tunnel. An explicit hosts override still wins
+    // over the config toggle.
+    port == 443
+        && (matches_sni_rewrite(host, youtube_via_relay) || hosts_override(hosts, host).is_some())
 }
 
 async fn dispatch_tunnel(
@@ -489,15 +585,60 @@ async fn dispatch_tunnel(
     fronter: Option<Arc<DomainFronter>>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
+    tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
-    // 1. Explicit hosts override or SNI-rewrite suffix: for HTTPS targets,
-    //    always use the TLS SNI-rewrite tunnel.
-    if should_use_sni_rewrite(&rewrite_ctx.hosts, &host, port) {
+    // 0. User-configured passthrough list wins over every other path.
+    //    If the host matches `passthrough_hosts`, we raw-TCP it (through
+    //    upstream_socks5 if set) and never touch Apps Script, SNI-rewrite,
+    //    or MITM. Point: saves Apps Script quota on hosts the user already
+    //    has reachability to, and avoids MITM-breaking cert pinning on
+    //    hosts the user knows are cert-pinned. Issues #39, #127.
+    if matches_passthrough(&host, &rewrite_ctx.passthrough_hosts) {
+        let via = rewrite_ctx.upstream_socks5.as_deref();
+        tracing::info!(
+            "dispatch {}:{} -> raw-tcp ({}) (passthrough_hosts match)",
+            host,
+            port,
+            via.unwrap_or("direct")
+        );
+        plain_tcp_passthrough(sock, &host, port, via).await;
+        return Ok(());
+    }
+
+    // 1. Full tunnel mode: ALL traffic goes through the batch multiplexer
+    //    (Apps Script → tunnel node → real TCP). No MITM, no cert.
+    if rewrite_ctx.mode == Mode::Full {
+        let mux = match tunnel_mux {
+            Some(m) => m,
+            None => {
+                tracing::error!(
+                    "dispatch {}:{} -> full mode but no tunnel mux (should not happen)",
+                    host, port
+                );
+                return Ok(());
+            }
+        };
+        tracing::info!(
+            "dispatch {}:{} -> full tunnel (via batch mux)",
+            host, port
+        );
+        crate::tunnel_client::tunnel_connection(sock, &host, port, &mux).await?;
+        return Ok(());
+    }
+
+    // 2. Explicit hosts override or SNI-rewrite suffix: for HTTPS targets,
+    //    use the TLS SNI-rewrite tunnel (skipped in full mode above).
+    if should_use_sni_rewrite(
+        &rewrite_ctx.hosts,
+        &host,
+        port,
+        rewrite_ctx.youtube_via_relay,
+    ) {
         tracing::info!("dispatch {}:{} -> sni-rewrite tunnel (Google edge direct)", host, port);
         return do_sni_rewrite_tunnel_from_tcp(sock, &host, port, mitm, rewrite_ctx).await;
     }
 
-    // 2. google_only bootstrap: no Apps Script relay exists. Anything that
+    // 3. google_only bootstrap: no Apps Script relay exists. Anything that
     //    isn't SNI-rewrite-matched gets direct TCP passthrough so the user's
     //    browser still works while they're deploying Code.gs. They'd switch
     //    to apps_script mode for the real DPI bypass.
@@ -1127,13 +1268,22 @@ where
     // x.com's GraphQL endpoints concatenate three huge JSON blobs into
     // the query string: `?variables=<json>&features=<json>&fieldToggles=<json>`.
     // The combined URL regularly exceeds Apps Script's URL length limit
-    // (it returns a generic "relay error" with no useful detail). The
-    // `variables=` portion alone is enough for x.com to serve the
-    // timeline — `features` / `fieldToggles` are client-capability
-    // hints it tolerates being absent. Truncating at the first `&`
-    // after `?variables=` ships a working request that fits under the
-    // limit. Ported from upstream Python 2d959d4 (p0u1ya's fix).
-    let path = if host.eq_ignore_ascii_case("x.com")
+    // (Apps Script returns "بیش از حد مجاز: طول نشانی وب URLFetch" /
+    // "URLFetch URL length exceeded"). The `variables=` portion alone
+    // is enough for x.com to serve the timeline — `features` /
+    // `fieldToggles` are client-capability hints it tolerates being
+    // absent. Truncating at the first `&` after `?variables=` ships a
+    // working request that fits under the limit. Ported from upstream
+    // Python 2d959d4 (p0u1ya's fix). Issue #64.
+    //
+    // Host matcher: browsers actually hit `www.x.com` (and sometimes
+    // `api.x.com`), not bare `x.com`. The original check only matched
+    // `x.com` exactly, so real traffic flew past the rewrite until
+    // pourya-p's log in #64 showed the real Host header. Match every
+    // subdomain of x.com here.
+    let host_lower = host.to_ascii_lowercase();
+    let is_x_com = host_lower == "x.com" || host_lower.ends_with(".x.com");
+    let path = if is_x_com
         && path.starts_with("/i/api/graphql/")
         && path.contains("?variables=")
     {
@@ -1537,9 +1687,85 @@ mod tests {
         let mut hosts = std::collections::HashMap::new();
         hosts.insert("example.com".to_string(), "1.2.3.4".to_string());
 
-        assert!(should_use_sni_rewrite(&hosts, "google.com", 443));
-        assert!(!should_use_sni_rewrite(&hosts, "google.com", 80));
-        assert!(should_use_sni_rewrite(&hosts, "www.example.com", 443));
-        assert!(!should_use_sni_rewrite(&hosts, "www.example.com", 80));
+        assert!(should_use_sni_rewrite(&hosts, "google.com", 443, false));
+        assert!(!should_use_sni_rewrite(&hosts, "google.com", 80, false));
+        assert!(should_use_sni_rewrite(&hosts, "www.example.com", 443, false));
+        assert!(!should_use_sni_rewrite(&hosts, "www.example.com", 80, false));
+    }
+
+    #[test]
+    fn youtube_via_relay_routes_youtube_through_relay_path() {
+        // Issue #102. When youtube_via_relay=true, YouTube suffixes
+        // must NOT match the SNI-rewrite path, so traffic falls
+        // through to Apps Script relay. Other Google suffixes are
+        // unaffected.
+        let hosts = std::collections::HashMap::new();
+
+        // Default behaviour: everything in the pool rewrites.
+        assert!(should_use_sni_rewrite(&hosts, "www.youtube.com", 443, false));
+        assert!(should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, false));
+        assert!(should_use_sni_rewrite(&hosts, "youtu.be", 443, false));
+        assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, false));
+
+        // With the toggle on: YouTube opts out, Google stays.
+        assert!(!should_use_sni_rewrite(&hosts, "www.youtube.com", 443, true));
+        assert!(!should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, true));
+        assert!(!should_use_sni_rewrite(&hosts, "youtu.be", 443, true));
+        assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, true));
+        assert!(should_use_sni_rewrite(&hosts, "fonts.gstatic.com", 443, true));
+    }
+
+    #[test]
+    fn hosts_override_beats_youtube_via_relay() {
+        // If the user added an explicit hosts override for a YouTube
+        // subdomain, it should win — the override is a deliberate
+        // user choice, the toggle is a default policy.
+        let mut hosts = std::collections::HashMap::new();
+        hosts.insert("rr4.googlevideo.com".to_string(), "1.2.3.4".to_string());
+
+        assert!(should_use_sni_rewrite(&hosts, "rr4.googlevideo.com", 443, true));
+    }
+
+    #[test]
+    fn passthrough_hosts_exact_match() {
+        let list = vec!["example.com".to_string(), "banking.local".to_string()];
+        assert!(matches_passthrough("example.com", &list));
+        assert!(matches_passthrough("banking.local", &list));
+        assert!(matches_passthrough("EXAMPLE.COM", &list)); // case-insensitive
+        assert!(!matches_passthrough("notexample.com", &list));
+        assert!(!matches_passthrough("sub.example.com", &list)); // exact only, not suffix
+    }
+
+    #[test]
+    fn passthrough_hosts_dot_prefix_is_suffix_match() {
+        let list = vec![".internal.example".to_string()];
+        assert!(matches_passthrough("internal.example", &list)); // bare parent matches
+        assert!(matches_passthrough("a.internal.example", &list));
+        assert!(matches_passthrough("a.b.c.internal.example", &list));
+        assert!(!matches_passthrough("internal.exampleX", &list));
+        assert!(!matches_passthrough("fakeinternal.example", &list));
+    }
+
+    #[test]
+    fn passthrough_hosts_empty_list_never_matches() {
+        let list: Vec<String> = vec![];
+        assert!(!matches_passthrough("anything.com", &list));
+        assert!(!matches_passthrough("", &list));
+    }
+
+    #[test]
+    fn passthrough_hosts_ignores_empty_and_whitespace_entries() {
+        let list = vec!["".to_string(), "   ".to_string(), "real.com".to_string()];
+        assert!(!matches_passthrough("", &list));
+        assert!(matches_passthrough("real.com", &list));
+    }
+
+    #[test]
+    fn passthrough_hosts_trailing_dot_normalized() {
+        // FQDNs sometimes have a trailing dot; both entry-side and host-side
+        // trailing dots should be treated as equivalent to the un-dotted form.
+        let list = vec!["example.com.".to_string()];
+        assert!(matches_passthrough("example.com", &list));
+        assert!(matches_passthrough("example.com.", &list));
     }
 }

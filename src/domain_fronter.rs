@@ -57,8 +57,13 @@ pub enum FronterError {
 
 type PooledStream = TlsStream<TcpStream>;
 const POOL_TTL_SECS: u64 = 45;
-const POOL_MAX: usize = 20;
+const POOL_MAX: usize = 80;
 const REQUEST_TIMEOUT_SECS: u64 = 25;
+const RANGE_PARALLEL_CHUNK_BYTES: u64 = 256 * 1024;
+// Keep synthetic range stitching bounded. Without this, a buggy or hostile
+// origin can advertise `Content-Range: bytes 0-1/<huge>` and make us build a
+// massive range plan or preallocate an enormous response buffer.
+const MAX_STITCHED_RANGE_BYTES: u64 = 64 * 1024 * 1024;
 
 struct PoolEntry {
     stream: PooledStream,
@@ -105,6 +110,19 @@ pub struct DomainFronter {
     /// on the slow path (once per relayed request), so a plain Mutex is
     /// fine.
     per_site: Arc<std::sync::Mutex<HashMap<String, HostStat>>>,
+    /// Daily-scoped counters, reset at 00:00 UTC. Tracks what *this
+    /// mhrv-rs process* has observed today — NOT the authoritative
+    /// Apps Script quota bucket on Google's side (which counts across
+    /// every client hitting the same deployment). Useful as a local
+    /// "budget used today" estimate in the UI.
+    ///
+    /// Both counters rebase to zero the first time any recording call
+    /// crosses a UTC date boundary. `day_key` holds "YYYY-MM-DD" of
+    /// the currently-counted day; when we see a new date we swap and
+    /// clear the counters.
+    today_calls: AtomicU64,
+    today_bytes: AtomicU64,
+    today_key: std::sync::Mutex<String>,
 }
 
 /// Aggregated stats for one remote host.
@@ -156,6 +174,47 @@ struct RelayResponse {
     e: Option<String>,
 }
 
+/// Parsed tunnel response JSON (full mode).
+#[derive(Deserialize, Debug, Clone)]
+pub struct TunnelResponse {
+    #[serde(default)]
+    pub sid: Option<String>,
+    #[serde(default)]
+    pub d: Option<String>,
+    #[serde(default)]
+    pub eof: Option<bool>,
+    #[serde(default)]
+    pub e: Option<String>,
+    /// Structured error code from the tunnel-node (e.g. `UNSUPPORTED_OP`).
+    /// `None` for legacy tunnel-nodes; clients should fall back to parsing
+    /// `e` only when this is `None` and compatibility is needed.
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+/// A single op in a batch tunnel request.
+#[derive(Serialize, Clone, Debug)]
+pub struct BatchOp {
+    pub op: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub d: Option<String>,
+}
+
+/// Batch tunnel response from Apps Script / tunnel node.
+#[derive(Deserialize, Debug)]
+pub struct BatchTunnelResponse {
+    #[serde(default)]
+    pub r: Vec<TunnelResponse>,
+    #[serde(default)]
+    pub e: Option<String>,
+}
+
 impl DomainFronter {
     pub fn new(config: &Config) -> Result<Self, FronterError> {
         let script_ids = config.script_ids_resolved();
@@ -200,7 +259,28 @@ impl DomainFronter {
             relay_failures: AtomicU64::new(0),
             bytes_relayed: AtomicU64::new(0),
             per_site: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            today_calls: AtomicU64::new(0),
+            today_bytes: AtomicU64::new(0),
+            today_key: std::sync::Mutex::new(current_utc_day_key()),
         })
+    }
+
+    /// Record one relay call toward the daily budget. Called once per
+    /// outbound Apps Script fetch. Rolls over both daily counters at
+    /// 00:00 UTC.
+    fn record_today(&self, bytes: u64) {
+        let today = current_utc_day_key();
+        // Fast path: same day as what we last saw. No lock.
+        let mut guard = self.today_key.lock().unwrap();
+        if *guard != today {
+            // Date rolled over — reset counters before this call is counted.
+            *guard = today;
+            self.today_calls.store(0, Ordering::Relaxed);
+            self.today_bytes.store(0, Ordering::Relaxed);
+        }
+        drop(guard);
+        self.today_calls.fetch_add(1, Ordering::Relaxed);
+        self.today_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Increment the per-site counters. Called on every logical request
@@ -231,6 +311,20 @@ impl DomainFronter {
 
     pub fn snapshot_stats(&self) -> StatsSnapshot {
         let bl = self.blacklist.lock().unwrap();
+        // Read today_key under lock and cheaply check rollover so the
+        // UI never sees stale "today_calls=1847" on a day where no
+        // traffic has flowed yet (e.g. user left the app open past
+        // midnight UTC).
+        let today_now = current_utc_day_key();
+        let today_key = {
+            let mut guard = self.today_key.lock().unwrap();
+            if *guard != today_now {
+                *guard = today_now.clone();
+                self.today_calls.store(0, Ordering::Relaxed);
+                self.today_bytes.store(0, Ordering::Relaxed);
+            }
+            guard.clone()
+        };
         StatsSnapshot {
             relay_calls: self.relay_calls.load(Ordering::Relaxed),
             relay_failures: self.relay_failures.load(Ordering::Relaxed),
@@ -241,7 +335,19 @@ impl DomainFronter {
             cache_bytes: self.cache.size(),
             blacklisted_scripts: bl.len(),
             total_scripts: self.script_ids.len(),
+            today_calls: self.today_calls.load(Ordering::Relaxed),
+            today_bytes: self.today_bytes.load(Ordering::Relaxed),
+            today_key,
+            today_reset_secs: seconds_until_utc_midnight(),
         }
+    }
+
+    pub fn num_scripts(&self) -> usize {
+        self.script_ids.len()
+    }
+
+    pub fn script_id_list(&self) -> &[String] {
+        &self.script_ids
     }
 
     pub fn cache(&self) -> &ResponseCache {
@@ -252,7 +358,7 @@ impl DomainFronter {
         self.coalesced.load(Ordering::Relaxed)
     }
 
-    fn next_script_id(&self) -> String {
+    pub fn next_script_id(&self) -> String {
         let n = self.script_ids.len();
         let mut bl = self.blacklist.lock().unwrap();
         let now = Instant::now();
@@ -552,8 +658,8 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Vec<u8> {
-        const CHUNK: u64 = 256 * 1024;
         const MAX_PARALLEL: usize = 16;
+        let chunk = RANGE_PARALLEL_CHUNK_BYTES;
 
         if method != "GET" || !body.is_empty() {
             return self.relay(method, url, headers, body).await;
@@ -566,7 +672,7 @@ impl DomainFronter {
 
         // Probe with the first chunk.
         let mut probe_headers: Vec<(String, String)> = headers.to_vec();
-        probe_headers.push(("Range".into(), format!("bytes=0-{}", CHUNK - 1)));
+        probe_headers.push(("Range".into(), format!("bytes=0-{}", chunk - 1)));
         let first = self.relay(method, url, &probe_headers, body).await;
 
         let (status, resp_headers, resp_body) = match split_response(&first) {
@@ -580,7 +686,7 @@ impl DomainFronter {
             return first;
         }
 
-        let probe_range = match validate_probe_range(status, &resp_headers, resp_body, CHUNK - 1)
+        let probe_range = match validate_probe_range(status, &resp_headers, resp_body, chunk - 1)
         {
             Some(r) => r,
             None => {
@@ -593,15 +699,27 @@ impl DomainFronter {
         };
         let total = probe_range.total;
 
-        if total <= CHUNK || (probe_range.end + 1) >= total {
+        if total <= chunk || (probe_range.end + 1) >= total {
             return rewrite_206_to_200(&first);
         }
+
+        let total_usize = match checked_stitched_range_capacity(total) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(
+                    "range-parallel: Content-Range total {} for {} is too large; falling back to single GET",
+                    total,
+                    url,
+                );
+                return self.relay(method, url, headers, body).await;
+            }
+        };
 
         // Plan remaining ranges after what the probe already returned.
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         let mut start = probe_range.end + 1;
         while start < total {
-            let end = (start + CHUNK - 1).min(total - 1);
+            let end = (start + chunk - 1).min(total - 1);
             ranges.push((start, end));
             start = end + 1;
         }
@@ -638,7 +756,7 @@ impl DomainFronter {
             .await;
 
         // Stitch: probe body first, then the chunks in order.
-        let mut full = Vec::with_capacity(total as usize);
+        let mut full = Vec::with_capacity(total_usize);
         full.extend_from_slice(resp_body);
         for (start, end, chunk) in fetches {
             match chunk {
@@ -693,12 +811,31 @@ impl DomainFronter {
                 return error_response(502, &format!("Relay error: {}", e));
             }
             Err(_) => {
+                // Timeout here means Apps Script didn't respond within
+                // REQUEST_TIMEOUT_SECS (currently 25). The most common
+                // cause by far is the account's daily UrlFetchApp quota
+                // being exhausted — once Google kills the script mid-exec,
+                // our relay hangs until timeout because no body ever comes
+                // back. Surface that possibility in the message instead
+                // of just "timeout", which has burned several users asking
+                // "why did it work yesterday" (see issues #99, #111, #105).
                 self.relay_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::error!("Relay timeout");
-                return error_response(504, "Relay timeout");
+                tracing::error!("Relay timeout — Apps Script unresponsive");
+                return error_response(
+                    504,
+                    "Relay timeout — Apps Script did not respond. \
+                     Most likely cause: daily UrlFetchApp quota exhausted \
+                     (resets 00:00 UTC). Other possibilities: script.google.com \
+                     unreachable from your network, or the Apps Script edge is having issues. \
+                     Check the script's Executions tab at script.google.com for the real error.",
+                );
             }
         };
         self.bytes_relayed.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        // Daily-budget counters (reset at 00:00 UTC). Only counts
+        // successful relays — the two error branches above don't reach
+        // here, matching what Google actually billed to quota.
+        self.record_today(bytes.len() as u64);
 
         if let Some(k) = cache_key_opt {
             if let Some(ttl) = parse_ttl(&bytes, url) {
@@ -922,6 +1059,235 @@ impl DomainFronter {
         };
         Ok(serde_json::to_vec(&req)?)
     }
+
+    // ────── Full-mode tunnel protocol ──────────────────────────────────
+
+    /// Send a tunnel-protocol request through the domain-fronted connection
+    /// to Apps Script. Reuses the same TLS pool as `relay()` but builds a
+    /// tunnel JSON payload (the `t` field triggers `_doTunnel` in CodeFull.gs).
+    pub async fn tunnel_request(
+        &self,
+        op: &str,
+        host: Option<&str>,
+        port: Option<u16>,
+        sid: Option<&str>,
+        data: Option<String>,
+    ) -> Result<TunnelResponse, FronterError> {
+        let payload = self.build_tunnel_payload(op, host, port, sid, data)?;
+        let script_id = self.next_script_id();
+        let path = format!("/macros/s/{}/exec", script_id);
+
+        let mut entry = self.acquire().await?;
+
+        let req_head = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             Accept-Encoding: gzip\r\n\
+             Connection: keep-alive\r\n\
+             \r\n",
+            path = path,
+            host = self.http_host,
+            len = payload.len(),
+        );
+        entry.stream.write_all(req_head.as_bytes()).await?;
+        entry.stream.write_all(&payload).await?;
+        entry.stream.flush().await?;
+
+        let (mut status, mut resp_headers, mut resp_body) =
+            read_http_response(&mut entry.stream).await?;
+
+        // Follow redirect chain (Apps Script usually redirects /exec to
+        // googleusercontent.com). Same logic as do_relay_once_with.
+        for _ in 0..5 {
+            if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+                break;
+            }
+            let Some(loc) = header_get(&resp_headers, "location") else {
+                break;
+            };
+            let (rpath, rhost) = parse_redirect(&loc);
+            let rhost = rhost.unwrap_or_else(|| self.http_host.to_string());
+            let req = format!(
+                "GET {rpath} HTTP/1.1\r\n\
+                 Host: {rhost}\r\n\
+                 Accept-Encoding: gzip\r\n\
+                 Connection: keep-alive\r\n\
+                 \r\n",
+            );
+            entry.stream.write_all(req.as_bytes()).await?;
+            entry.stream.flush().await?;
+            let (s, h, b) = read_http_response(&mut entry.stream).await?;
+            status = s;
+            resp_headers = h;
+            resp_body = b;
+        }
+
+        if status != 200 {
+            let body_txt = String::from_utf8_lossy(&resp_body)
+                .chars()
+                .take(200)
+                .collect::<String>();
+            if should_blacklist(status, &body_txt) {
+                self.blacklist_script(&script_id, &format!("HTTP {}", status));
+            }
+            return Err(FronterError::Relay(format!(
+                "tunnel HTTP {}: {}",
+                status, body_txt
+            )));
+        }
+
+        // Parse tunnel response JSON
+        let text = std::str::from_utf8(&resp_body)
+            .map_err(|_| FronterError::BadResponse("non-utf8 tunnel response".into()))?
+            .trim();
+
+        // Apps Script may prepend HTML; extract first {...}
+        let json_str = if text.starts_with('{') {
+            text
+        } else {
+            let start = text.find('{').ok_or_else(|| {
+                FronterError::BadResponse(format!("no json in tunnel response: {}", &text[..text.len().min(200)]))
+            })?;
+            let end = text.rfind('}').ok_or_else(|| {
+                FronterError::BadResponse("no json end in tunnel response".into())
+            })?;
+            &text[start..=end]
+        };
+
+        let resp: TunnelResponse = serde_json::from_str(json_str)?;
+
+        self.release(entry).await;
+        Ok(resp)
+    }
+
+    fn build_tunnel_payload(
+        &self,
+        op: &str,
+        host: Option<&str>,
+        port: Option<u16>,
+        sid: Option<&str>,
+        data: Option<String>,
+    ) -> Result<Vec<u8>, FronterError> {
+        let mut map = serde_json::Map::new();
+        map.insert("k".into(), Value::String(self.auth_key.clone()));
+        map.insert("t".into(), Value::String(op.to_string()));
+        if let Some(h) = host {
+            map.insert("h".into(), Value::String(h.to_string()));
+        }
+        if let Some(p) = port {
+            map.insert("p".into(), Value::Number(serde_json::Number::from(p)));
+        }
+        if let Some(s) = sid {
+            map.insert("sid".into(), Value::String(s.to_string()));
+        }
+        if let Some(d) = data {
+            map.insert("d".into(), Value::String(d));
+        }
+        Ok(serde_json::to_vec(&Value::Object(map))?)
+    }
+
+    /// Send a batch of tunnel operations in one Apps Script round trip.
+    /// All active sessions' data is collected and sent together, and all
+    /// responses come back in one response. This reduces N Apps Script
+    /// calls to 1 per tick.
+    pub async fn tunnel_batch_request(
+        &self,
+        ops: &[BatchOp],
+    ) -> Result<BatchTunnelResponse, FronterError> {
+        let script_id = self.next_script_id();
+        self.tunnel_batch_request_to(&script_id, ops).await
+    }
+
+    /// Like `tunnel_batch_request` but targets a specific deployment ID.
+    /// Used by the pipeline mux to pin a batch to a deployment whose
+    /// per-account concurrency slot has already been acquired.
+    pub async fn tunnel_batch_request_to(
+        &self,
+        script_id: &str,
+        ops: &[BatchOp],
+    ) -> Result<BatchTunnelResponse, FronterError> {
+        let mut map = serde_json::Map::new();
+        map.insert("k".into(), Value::String(self.auth_key.clone()));
+        map.insert("t".into(), Value::String("batch".into()));
+        map.insert("ops".into(), serde_json::to_value(ops)?);
+        let payload = serde_json::to_vec(&Value::Object(map))?;
+
+        let path = format!("/macros/s/{}/exec", script_id);
+
+        let mut entry = self.acquire().await?;
+
+        let req_head = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             Accept-Encoding: gzip\r\n\
+             Connection: keep-alive\r\n\
+             \r\n",
+            path = path,
+            host = self.http_host,
+            len = payload.len(),
+        );
+        entry.stream.write_all(req_head.as_bytes()).await?;
+        entry.stream.write_all(&payload).await?;
+        entry.stream.flush().await?;
+
+        let (mut status, mut resp_headers, mut resp_body) =
+            read_http_response(&mut entry.stream).await?;
+
+        // Follow redirect chain
+        for _ in 0..5 {
+            if !matches!(status, 301 | 302 | 303 | 307 | 308) { break; }
+            let Some(loc) = header_get(&resp_headers, "location") else { break; };
+            let (rpath, rhost) = parse_redirect(&loc);
+            let rhost = rhost.unwrap_or_else(|| self.http_host.to_string());
+            let req = format!(
+                "GET {rpath} HTTP/1.1\r\nHost: {rhost}\r\nAccept-Encoding: gzip\r\nConnection: keep-alive\r\n\r\n",
+            );
+            entry.stream.write_all(req.as_bytes()).await?;
+            entry.stream.flush().await?;
+            let (s, h, b) = read_http_response(&mut entry.stream).await?;
+            status = s; resp_headers = h; resp_body = b;
+        }
+
+        if status != 200 {
+            let body_txt = String::from_utf8_lossy(&resp_body).chars().take(200).collect::<String>();
+            if should_blacklist(status, &body_txt) {
+                self.blacklist_script(&script_id, &format!("HTTP {}", status));
+            }
+            return Err(FronterError::Relay(format!("batch tunnel HTTP {}: {}", status, body_txt)));
+        }
+
+        let text = std::str::from_utf8(&resp_body)
+            .map_err(|_| FronterError::BadResponse("non-utf8 batch response".into()))?
+            .trim();
+
+        let json_str = if text.starts_with('{') {
+            text
+        } else {
+            let start = text.find('{').ok_or_else(|| {
+                FronterError::BadResponse(format!("no json in batch response: {}", &text[..text.len().min(200)]))
+            })?;
+            let end = text.rfind('}').ok_or_else(|| {
+                FronterError::BadResponse("no json end in batch response".into())
+            })?;
+            &text[start..=end]
+        };
+
+        tracing::debug!("batch response body: {}", &json_str[..json_str.len().min(500)]);
+
+        let resp: BatchTunnelResponse = match serde_json::from_str(json_str) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("batch JSON parse error: {} — body: {}", e, &json_str[..json_str.len().min(300)]);
+                return Err(FronterError::Json(e));
+            }
+        };
+        self.release(entry).await;
+        Ok(resp)
+    }
 }
 
 /// Strip connection-specific headers (matches Code.gs SKIP_HEADERS) and
@@ -1030,6 +1396,13 @@ fn validate_probe_range(
     Some(range)
 }
 
+fn checked_stitched_range_capacity(total: u64) -> Option<usize> {
+    if total > MAX_STITCHED_RANGE_BYTES {
+        return None;
+    }
+    usize::try_from(total).ok()
+}
+
 fn extract_exact_range_body(
     raw: &[u8],
     start: u64,
@@ -1131,6 +1504,60 @@ fn normalize_x_graphql_url(url: &str) -> String {
     };
     let scheme = if url.starts_with("https://") { "https://" } else { "http://" };
     format!("{}{}{}?{}", scheme, host, path, new_query)
+}
+
+/// "YYYY-MM-DD" of the current UTC date. Used as the daily-reset
+/// boundary for `today_calls` / `today_bytes`. We format manually so
+/// this stays std-only and doesn't pull `time` or `chrono` for a
+/// ~20-line helper.
+fn current_utc_day_key() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, m, d) = unix_to_ymd_utc(secs);
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// Seconds until the next 00:00 UTC. Used by the UI to render a
+/// "resets in Xh Ym" countdown without the UI having to import time
+/// libraries. Conservative: if the system clock is broken we return
+/// 0 instead of a huge negative-looking number.
+fn seconds_until_utc_midnight() -> u64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let day = 86_400u64;
+    let rem = secs % day;
+    if rem == 0 {
+        day
+    } else {
+        day - rem
+    }
+}
+
+/// Convert a Unix timestamp (seconds since 1970-01-01 UTC) to a
+/// (year, month, day) tuple, UTC. Standalone so we can stay
+/// std-only — no chrono/time/jiff dependency pulled for one caller.
+///
+/// Algorithm: Howard Hinnant's civil_from_days, widely cited and
+/// simple enough to audit by eye. Works for years 1970–9999 which
+/// we'll outlive.
+fn unix_to_ymd_utc(secs: u64) -> (i64, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    // Shift so day 0 is 0000-03-01 (Hinnant's era-based trick).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32)
 }
 
 fn extract_host(url: &str) -> Option<String> {
@@ -1235,12 +1662,35 @@ fn build_sni_pool(primary: &str) -> Vec<String> {
 
 pub fn filter_forwarded_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     const SKIP: &[&str] = &[
+        // Hop-by-hop / framing — must not be forwarded across the proxy.
         "host",
         "connection",
         "content-length",
         "transfer-encoding",
         "proxy-connection",
         "proxy-authorization",
+        // Identity-revealing forwarding headers (issue #104).
+        // If the user sits behind another proxy or uses a browser
+        // extension that inserts any of these, they'd normally carry
+        // the client's real IP. We strip every known variant so the
+        // origin server only ever sees whatever source IP the Apps
+        // Script or GFE path terminates on — never the user's home IP.
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-port",
+        "x-forwarded-server",
+        "x-forwarded-ssl",
+        "forwarded",
+        "via",
+        "x-real-ip",
+        "x-client-ip",
+        "x-originating-ip",
+        "true-client-ip",
+        "cf-connecting-ip",
+        "fastly-client-ip",
+        "x-cluster-client-ip",
+        "client-ip",
     ];
     headers
         .iter()
@@ -1548,7 +1998,7 @@ fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
     Ok(out)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StatsSnapshot {
     pub relay_calls: u64,
     pub relay_failures: u64,
@@ -1559,6 +2009,17 @@ pub struct StatsSnapshot {
     pub cache_bytes: usize,
     pub blacklisted_scripts: usize,
     pub total_scripts: usize,
+    /// Relay calls attributed to the current UTC day. Resets at 00:00 UTC.
+    /// This is what-this-process-has-done today, not the Google-side bucket.
+    pub today_calls: u64,
+    /// Response bytes from relay calls attributed to the current UTC day.
+    pub today_bytes: u64,
+    /// "YYYY-MM-DD" of the day `today_calls` / `today_bytes` refer to.
+    /// Useful for cross-referencing against Google's dashboard.
+    pub today_key: String,
+    /// Seconds until the next 00:00 UTC rollover. Convenient for the UI
+    /// to render "Resets in Xh Ym" without importing time libraries.
+    pub today_reset_secs: u64,
 }
 
 impl StatsSnapshot {
@@ -1584,6 +2045,32 @@ impl StatsSnapshot {
             self.cache_bytes / 1024,
             self.total_scripts - self.blacklisted_scripts,
             self.total_scripts,
+        )
+    }
+
+    /// Hand-rolled JSON serialization so the Android side can read the
+    /// snapshot via JNI without pulling `serde_derive` through this struct.
+    /// Field names match the Rust side verbatim so Kotlin can `JSONObject`
+    /// parse them directly.
+    pub fn to_json(&self) -> String {
+        fn esc(s: &str) -> String {
+            s.replace('\\', "\\\\").replace('"', "\\\"")
+        }
+        format!(
+            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{}}}"#,
+            self.relay_calls,
+            self.relay_failures,
+            self.coalesced,
+            self.bytes_relayed,
+            self.cache_hits,
+            self.cache_misses,
+            self.cache_bytes,
+            self.blacklisted_scripts,
+            self.total_scripts,
+            self.today_calls,
+            self.today_bytes,
+            esc(&self.today_key),
+            self.today_reset_secs,
         )
     }
 }
@@ -1721,6 +2208,80 @@ impl ServerCertVerifier for NoVerify {
 mod tests {
     use super::*;
     use tokio::io::{duplex, AsyncWriteExt};
+
+    #[test]
+    fn unix_to_ymd_utc_handles_known_epochs() {
+        // Anchors chosen to catch the common off-by-one errors (pre/post
+        // leap day, pre/post epoch, year-end rollover).
+        assert_eq!(unix_to_ymd_utc(0), (1970, 1, 1));                    // epoch
+        assert_eq!(unix_to_ymd_utc(86_399), (1970, 1, 1));               // one sec before day 2
+        assert_eq!(unix_to_ymd_utc(86_400), (1970, 1, 2));               // day 2 starts at midnight
+        assert_eq!(unix_to_ymd_utc(951_782_400), (2000, 2, 29));         // leap day (Feb 29, 2000)
+        assert_eq!(unix_to_ymd_utc(951_868_800), (2000, 3, 1));          // day after leap Feb
+        assert_eq!(unix_to_ymd_utc(1_583_020_800), (2020, 3, 1));        // day after a leap Feb
+        assert_eq!(unix_to_ymd_utc(1_735_689_599), (2024, 12, 31));      // last sec of 2024
+        assert_eq!(unix_to_ymd_utc(1_735_689_600), (2025, 1, 1));        // first sec of 2025
+    }
+
+    #[test]
+    fn seconds_until_utc_midnight_is_bounded() {
+        let n = seconds_until_utc_midnight();
+        // Must be in (0, 86400] for any valid system clock.
+        assert!(n > 0 && n <= 86_400);
+    }
+
+    #[test]
+    fn filter_forwarded_headers_strips_identity_revealing_headers() {
+        // Issue #104: any proxy/extension that inserts these must not
+        // leak the client's real IP to origin via the Apps Script relay.
+        let input: Vec<(String, String)> = vec![
+            ("X-Forwarded-For".into(), "203.0.113.42".into()),
+            ("X-Real-IP".into(), "203.0.113.42".into()),
+            ("Forwarded".into(), "for=203.0.113.42".into()),
+            ("Via".into(), "1.1 squid".into()),
+            ("CF-Connecting-IP".into(), "203.0.113.42".into()),
+            ("True-Client-IP".into(), "203.0.113.42".into()),
+            ("X-Client-IP".into(), "203.0.113.42".into()),
+            ("Fastly-Client-IP".into(), "203.0.113.42".into()),
+            ("X-Cluster-Client-IP".into(), "203.0.113.42".into()),
+            ("Client-IP".into(), "203.0.113.42".into()),
+            ("X-Originating-IP".into(), "203.0.113.42".into()),
+            ("X-Forwarded-Host".into(), "internal.example".into()),
+            ("X-Forwarded-Proto".into(), "https".into()),
+            ("X-Forwarded-Port".into(), "8080".into()),
+            ("X-Forwarded-Server".into(), "lb-01.example".into()),
+            ("X-Forwarded-Ssl".into(), "on".into()),
+            // Mix in a legitimate header that MUST pass through.
+            ("User-Agent".into(), "Mozilla/5.0".into()),
+            ("Accept".into(), "text/html".into()),
+        ];
+        let out = filter_forwarded_headers(&input);
+        let keys: Vec<String> = out.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
+        // All identity-revealing headers must be dropped.
+        for h in [
+            "x-forwarded-for",
+            "x-real-ip",
+            "forwarded",
+            "via",
+            "cf-connecting-ip",
+            "true-client-ip",
+            "x-client-ip",
+            "fastly-client-ip",
+            "x-cluster-client-ip",
+            "client-ip",
+            "x-originating-ip",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "x-forwarded-server",
+            "x-forwarded-ssl",
+        ] {
+            assert!(!keys.iter().any(|k| k == h), "{} must be stripped", h);
+        }
+        // And legitimate headers must survive.
+        assert!(keys.iter().any(|k| k == "user-agent"));
+        assert!(keys.iter().any(|k| k == "accept"));
+    }
 
     #[test]
     fn normalize_x_graphql_trims_after_variables() {
@@ -1868,6 +2429,16 @@ mod tests {
     fn validate_probe_range_rejects_body_length_mismatch() {
         let headers = vec![("Content-Range".to_string(), "bytes 0-4/20".to_string())];
         assert!(validate_probe_range(206, &headers, b"hey", 4).is_none());
+    }
+
+    #[test]
+    fn stitched_range_capacity_rejects_absurd_total() {
+        assert_eq!(
+            checked_stitched_range_capacity(MAX_STITCHED_RANGE_BYTES),
+            Some(MAX_STITCHED_RANGE_BYTES as usize),
+        );
+        assert_eq!(checked_stitched_range_capacity(MAX_STITCHED_RANGE_BYTES + 1), None);
+        assert_eq!(checked_stitched_range_capacity(u64::MAX), None);
     }
 
     #[test]
